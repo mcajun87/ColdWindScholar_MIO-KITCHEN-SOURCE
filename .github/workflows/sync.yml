@@ -36,7 +36,7 @@ jobs:
           # 2. 获取原作者所有分支的最新更新
           git fetch upstream --prune
 
-          # 3. 定义你需要同步的分支（如需同步 master 可自行修改）
+          # 3. 定义你需要同步的分支
           TARGET_BRANCHES=("main")
 
           # 4. 循环遍历并逐个分支合并推送
