@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 import platform
 import shutil
@@ -20,19 +21,17 @@ import subprocess
 import sys
 import zipfile
 from platform import system
-
+import importlib.util
 from pip._internal.cli.main import main as _main
-
 
 class Builder:
     def __init__(self):
         ostype = system()
-        try:
-            from tkinter import END
-        except:
-            raise FileNotFoundError("Tkinter is not exist!\nThe dist may not Work!")
         if ostype == 'Linux':
-            name = 'MIO-KITCHEN-linux.zip'
+            if platform.machine() == 'aarch64':
+                name = 'MIO-KITCHEN-linux-aarch64.zip'
+            else:
+                name = 'MIO-KITCHEN-linux.zip'
         elif ostype == 'Darwin':
             if platform.machine() == 'x86_64':
                 name = 'MIO-KITCHEN-macos-intel.zip'
@@ -43,15 +42,26 @@ class Builder:
         self.name = name
         self.local = os.getcwd()
         self.ostype = ostype
-        self.dndplat = None
 
     def build(self):
         print('Building...')
         self.install_package()
         self.unit_test()
+        self.patch_libs()
         self.pyinstaller_build()
         self.config_folder()
         self.pack_zip(f'{self.local}/dist', self.name)
+
+    def patch_libs(self):
+        print("Patching libs")
+        spec = importlib.util.find_spec('qfluentwidgets')
+        target_file = os.path.join(os.path.dirname(spec.origin), "common", "config.py")
+        with open(target_file, "r", encoding="utf-8", newline="\n") as f:
+            data = f.readlines()
+            data_index = 14
+            data[data_index] = "ALERT = None"
+        with open(target_file, "w", encoding="utf-8", newline="\n") as f:
+            f.writelines(data)
 
     def run_command(self, command: list[str], strip: bool = False):
         try:
@@ -63,9 +73,9 @@ class Builder:
     def generate_release_body(self):
         print('Generating Release Body...')
         # load config
-        with open('bin/setting.ini', 'r', encoding='utf-8') as f:
-            ver = [line for line in f.readlines() if 'version' in line]
-            ver = ver[0].strip().split(' = ')[1]
+        with open('bin/settings.json', 'r', encoding='utf-8') as f:
+            ver = json.load(f)
+            ver = ver['Tool']['Version']
         with open('body.md', 'w', encoding='utf-8', newline='\n') as f:
             f.write(f"Build times: {os.getenv('GITHUB_RUN_NUMBER')}\n")
             f.write(f"Actor: {os.getenv('GITHUB_TRIGGERING_ACTOR')}\n")
@@ -78,10 +88,10 @@ class Builder:
             f.write(f'```\n')
 
     def move_artifacts(self):
-        with open('bin/setting.ini', 'r', encoding='utf-8') as f:
-            ver = [line for line in f.readlines() if 'version' in line]
-            ver = ver[0].strip().split(' = ')[1]
-        for i in ['MIO-KITCHEN-win', 'MIO-KITCHEN-linux', 'MIO-KITCHEN-macos', 'MIO-KITCHEN-macos-intel']:
+        with open('bin/settings.json', 'r', encoding='utf-8') as f:
+            ver = json.load(f)
+            ver = ver['Tool']['Version']
+        for i in ['MIO-KITCHEN-win', 'MIO-KITCHEN-linux', 'MIO-KITCHEN-linux-aarch64', 'MIO-KITCHEN-macos', 'MIO-KITCHEN-macos-intel']:
             name_list = i.rsplit('-')
             name_list.insert(2, ver)
             name = '-'.join(name_list)
@@ -107,94 +117,64 @@ class Builder:
 
     def pyinstaller_build(self):
         import PyInstaller.__main__
-        dndplat = self.dndplat
         if self.ostype == 'Darwin':
-            if platform.machine() == 'x86_64':
-                dndplat = 'osx-x64'
-            elif platform.machine() == 'arm64':
-                dndplat = 'osx-arm64'
             PyInstaller.__main__.run([
                 'tool.py',
-                '-Fw',
+                '-Dw',
+                '--exclude-module', 'tkinter',
                 '--exclude-module',
                 'numpy',
                 '-i',
                 'icon.ico',
                 '--collect-data',
-                'sv_ttk',
-                '--collect-data',
-                'chlorophyll',
-                '--collect-data',
                 'androguard',
                 '--hidden-import',
-                'tkinter',
-                '--hidden-import',
                 'PIL',
-                '--hidden-import',
-                'PIL._tkinter_finder'
             ])
         elif os.name == 'posix':
-            if self.ostype == 'Linux':
-                if platform.machine() == 'x86_64':
-                    dndplat = 'linux-x64'
-                elif platform.machine() == 'aarch64':
-                    dndplat = 'linux-arm64'
-                elif platform.machine() == 'loongarch64':
-                    dndplat = 'linux-loongarch64'
+
             PyInstaller.__main__.run([
                 'tool.py',
-                '-Fw',
+                '-Dw',
+                '--exclude-module', 'tkinter',
                 '--exclude-module',
                 'numpy',
                 '-i',
                 'icon.ico',
                 '--collect-data',
-                'sv_ttk',
-                '--collect-data',
-                'chlorophyll',
-                '--collect-data',
                 'androguard',
                 '--hidden-import',
-                'tkinter',
-                '--hidden-import',
                 'PIL',
-                '--hidden-import',
-                'PIL._tkinter_finder',
                 '--splash',
                 'splash_loongarch.png' if platform.machine() == 'loongarch64' else 'splash.png'
             ])
         elif os.name == 'nt':
-            mach_ = platform.machine()
-            platform.machine = lambda: 'x86' if platform.architecture()[0] == '32bit' and mach_ == 'AMD64' else mach_
-            if platform.machine() == 'x86':
-                dndplat = 'win-x86'
-            elif platform.machine() == 'AMD64':
-                dndplat = 'win-x64'
-            elif platform.machine() == 'ARM64':
-                dndplat = 'win-arm64'
             PyInstaller.__main__.run([
                 'tool.py',
-                '-Fw',
-                '--exclude-module',
-                'numpy',
+                '-Dw',
+                '--exclude-module', 'numpy',
+                '--exclude-module', 'tkinter',
                 '-i',
                 'icon.ico',
                 '--collect-data',
-                'sv_ttk',
-                '--collect-data',
-                'chlorophyll',
-                '--collect-data',
                 'androguard',
+                "--hidden-import",
+                "pywin32",
+                '--collect-all', 'pywin32',
+                '--collect-all', 'win32',
+                '--collect-all', 'win32api',
+                "--hidden-import", "win32api",
+                "--hidden-import", "win32com",
+                "--hidden-import", "win32",
                 '--splash',
                 'splash.png'
             ])
-        self.dndplat = dndplat
 
     def config_folder(self):
         if not os.path.exists('dist/bin'):
             os.makedirs('dist/bin', exist_ok=True)
-        while_list = ['images', 'languages', 'licenses', 'module', 'temp', 'extra_flash', 'setting.ini', self.ostype,
-                      'kemiaojiang.png', 'License_kemiaojiang.txt', "tkdnd", 'help_document.json', "exec.sh", 'update.json']
+        while_list = ['images', 'languages', 'licenses', 'module', 'temp', 'extra_flash', 'settings.json', self.ostype,
+                      'kemiaojiang.png', 'License_kemiaojiang.txt', 'help_document.json', "exec.sh", 'update.json']
         for i in os.listdir(self.local + "/bin"):
             if i in while_list:
                 if os.path.isdir(f"{self.local}/bin/{i}"):
@@ -203,26 +183,25 @@ class Builder:
                     shutil.copy(f"{self.local}/bin/{i}", f"{self.local}/dist/bin/{i}")
         if not os.path.exists('dist/LICENSE'):
             shutil.copy(f'{self.local}/LICENSE', f"{self.local}/dist/LICENSE")
-        if self.dndplat:
-            for i in os.listdir(f"{self.local}/dist/bin/tkdnd"):
-                if i[:3] == self.dndplat[:3] and i.endswith("x64") and self.dndplat.endswith('x86'):
-                    continue
-                if i == self.dndplat:
-                    continue
-                if os.path.isdir(f"{self.local}/dist/bin/tkdnd/{i}"):
-                    shutil.rmtree(f'{self.local}/dist/bin/tkdnd/{i}', ignore_errors=True)
-        else:
-            raise FileNotFoundError("Cannot Build!!!TkinterDnd2 Missing!!!!!!!!!!")
+
         if os.name == 'posix':
             if platform.machine() == 'x86_64' and os.path.exists(f'{self.local}/dist/bin/Linux/aarch64'):
                 try:
                     shutil.rmtree(f'{self.local}/dist/bin/Linux/aarch64')
                 except Exception as e:
                     print(e)
-            for root, dirs, files in os.walk(f'{self.local}/dist', topdown=True):
+            if platform.machine() == 'aarch64' and os.path.exists(f'{self.local}/dist/bin/Linux/x86_64'):
+                try:
+                    shutil.rmtree(f'{self.local}/dist/bin/Linux/x86_64')
+                except Exception as e:
+                    print(e)
+            for root, dirs, files in os.walk(f'{self.local}/dist/bin', topdown=True):
                 for i in files:
                     print(f"Chmod {os.path.join(root, i)}")
                     os.chmod(os.path.join(root, i), 0o7777, follow_symlinks=False)
+        os.rename(f'{self.local}/dist/tool', f'{self.local}/dist/tool_built')
+        shutil.copytree(f'{self.local}/dist/tool_built', f'{self.local}/dist', dirs_exist_ok=True)
+        shutil.rmtree(f'{self.local}/dist/tool_built')
 
     def pack_zip(self, source, name):
         abs_folder_path = os.path.abspath(source)

@@ -1,50 +1,118 @@
+# Copyright (C) 2022-2026 The MIO-KITCHEN-SOURCE Project
+#
+# Licensed under the GNU AFFERO GENERAL PUBLIC LICENSE, Version 3.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.gnu.org/licenses/agpl-3.0.en.html#license-text
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+import os
+import pathlib
+import platform
+import subprocess
 import sys
+import threading
+import time
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QSize, QTranslator, QObject
 from PySide6.QtGui import QIcon, QGuiApplication
 from PySide6.QtWidgets import QApplication
-from qfluentwidgets import NavigationItemPosition, SplashScreen, setTheme, Theme, FluentWindow, FluentIcon as FIF
-from qframelesswindow.windows import QSize
+from qfluentwidgets import (NavigationItemPosition, SplashScreen, FluentIcon as FIF, FluentWindow)
 
-from .about import AboutPage
-from .home import HomePage
-from .plugin import PluginPage
-from .project import ProjectPage
-from .settings import SettingsPage
+from src.qtui.apk_manager import ApkManagerPage
+from src.qtui.connect import ConnectPage
+from src.core.utils import temp, v_code, prog_path, tool_self
+from src.qtui.about import AboutPage
+from src.qtui.home import HomePage
+from src.qtui.plugins import PluginPage
+from src.qtui.projects import ProjectsPage
+from src.qtui.settings import SettingsPage
+from src.qtui.settings_cfg import cfg
+is_pro = False
+try:
+    from src.pro.sn import v as verify
 
+    is_pro = True
+except ImportError:
+    verify = None
+    is_pro = False
+if is_pro:
+    from src.pro.active_ui import Active
+pyi_splash_available = False
+if platform.system() != 'Darwin':
+    try:
+        import pyi_splash
+
+        pyi_splash.update_text('Loading ...')
+        pyi_splash_available = True
+    except ModuleNotFoundError:
+        ...
+if sys.platform == "linux" or sys.platform == "linux2":
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
-
-        # 设置主题
-        setTheme(Theme.DARK)
-
         self.setWindowIcon(QIcon('icon.ico'))
-        self.splashScreen = SplashScreen(self.windowIcon(), self)
-        self.splashScreen.setIconSize(QSize(140, 140))
+
+        # Create splash screen with error handling
+        try:
+            self.splashScreen = SplashScreen(self.windowIcon(), self)
+            self.splashScreen.setIconSize(QSize(140, 140))
+        except Exception as e:
+            # If splash screen fails due to opacity, just continue
+            print(f"Warning: SplashScreen creation skipped ({e})")
+            self.splashScreen = None
+        
         self.show()
-
-        # 设置窗口标题
-        self.setWindowTitle("MIO-KITCHEN")
-
         # 设置窗口大小
-        self.resize(900, 700)
+        self.resize(1000, 730)
 
         # 窗口居中显示
         self.center()
 
+        # Install event filter on title bar for dragging
+        self.translator = QTranslator()
         # 创建页面
         self.home_page = HomePage()
-        self.project_page = ProjectPage()
+        self.project_page = ProjectsPage()
         self.plugin_page = PluginPage()
+        self.connect_page = ConnectPage(projectPage=self.project_page)
+        self.apk_manager = ApkManagerPage()
         self.about_page = AboutPage()
         self.settings_page = SettingsPage()
 
+
         # 初始化导航
         self.initNavigation()
+        cfg.language.valueChanged.connect(self.load_language)
+        panel = self.project_page.build_project_section(self.titleBar)
+        self.titleBar.layout().insertWidget(1, panel, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.project_page.refresh_projects()
 
-        QTimer.singleShot(1000, self.splashScreen.finish)
+        # Finish splash screen if it was created
+        if self.splashScreen:
+            self.splashScreen.finish()
+        if is_pro:
+            if cfg.activeCode.value:
+                verify.verify(cfg.activeCode.value)
+            if not verify.state:
+                Active(verify, self).gui()
+
+    def load_language(self):
+        app = QApplication.instance()
+        if self.translator.load(cfg.language.value, os.path.join(prog_path, 'bin', 'languages')):
+            if not app:
+                return
+            app.installTranslator(self.translator)
+
 
     def center(self):
         desktop = QGuiApplication.primaryScreen().availableGeometry()
@@ -56,17 +124,45 @@ class MainWindow(FluentWindow):
 
     def initNavigation(self):
         # 添加导航项
-        self.addSubInterface(self.home_page, FIF.HOME, '主页')
-        self.addSubInterface(self.project_page, FIF.DOCUMENT, '项目')
-        self.addSubInterface(self.plugin_page, FIF.APPLICATION, '插件')
-        self.addSubInterface(self.about_page, FIF.INFO, '关于', NavigationItemPosition.BOTTOM)
-        self.addSubInterface(self.settings_page, FIF.SETTING, '设置', NavigationItemPosition.BOTTOM)
+        self.addSubInterface(self.home_page, FIF.HOME, self.tr('Home'))
+        self.addSubInterface(self.project_page, FIF.DOCUMENT, self.tr('Project'))
+        self.addSubInterface(self.plugin_page, FIF.APPLICATION, self.tr('Plugins'))
+        self.addSubInterface(self.connect_page, FIF.CONNECT, self.tr('Connect'))
+        self.addSubInterface(self.apk_manager, FIF.DEVELOPER_TOOLS, self.tr('ApkManager'))
+        self.addSubInterface(self.about_page, FIF.INFO, self.tr('About'), NavigationItemPosition.BOTTOM)
+        self.addSubInterface(self.settings_page, FIF.SETTING, self.tr("Settings"), NavigationItemPosition.BOTTOM)
 
         # 默认显示主页
         self.switchTo(self.home_page)
 
+    def restart(self):
+        def _inner():
+            argv = [sys.executable]
+            if not pathlib.Path(tool_self).samefile(pathlib.Path(argv[0])):
+                # only needed when running within a Python intepreter
+                argv.append(tool_self)
+            argv.extend(sys.argv[1:])
+            p = subprocess.Popen(argv)
+            p.wait()
+            sys.exit(p.returncode)
+
+        er = QApplication.instance()
+        try:
+            for i in er.findChildren(QObject):
+                try:
+                    i.deleteLater()
+                except (ValueError, AttributeError):
+                    logging.exception('Restart')
+            er.deleteLater()
+            self.connect_page.network_thread.terminate()
+        except (Exception, BaseException):
+            logging.exception('Restart')
+
+        threading.Thread(target=_inner).start()
+
 
 def __init__qt(args):
+    tool_log = f'{temp}/{time.strftime("%Y%m%d_%H-%M-%S", time.localtime())}_{v_code()}.log'
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
@@ -74,11 +170,22 @@ def __init__qt(args):
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
 
     app = QApplication(args)
+    translator = QTranslator()
+    if translator.load(cfg.language.value, os.path.join(prog_path, 'bin', 'languages')):
+        app.installTranslator(translator)
+    
+    os.makedirs(os.path.dirname(tool_log), exist_ok=True)
+    logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(asctime)s:%(filename)s:%(name)s:%(message)s',
+                        filename=tool_log, filemode='w')
     window = MainWindow()
+    window.load_language()
+    cfg.language.valueChanged.connect(window.restart)
     window.show()
-    sys.exit(app.exec_())
+    if pyi_splash_available:
+        pyi_splash.close()
+    sys.exit(app.exec())
 
 
-init = lambda args: __init__qt(args)
+init = __init__qt
 if __name__ == '__main__':
     init(sys.argv)

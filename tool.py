@@ -22,21 +22,18 @@ class DevNull(object):
         pass
 if not sys.stdout:
     sys.stdout = DevNull()
-import time
 if sys.version_info.major == 3:
     if sys.version_info.minor < 8:
         input(
             f"Not supported: [{sys.version}] yet\nEnter to quit\nSorry for any inconvenience caused")
         sys.exit(1)
 try:
-    from src.tkui.tool import *
+    from src.qtui.tool import *
 except Exception as e:
     sys.stdout = sys_stdout
     sys.stderr = sys_stderr
-    print(e)
-    print("Sorry! We cannot init the tool.\nPlease report this error to developers.!")
-    time.sleep(3)
-    sys.exit(1)
+    raise e
+
 
 if __name__ == "__main__":
     init(sys.argv)

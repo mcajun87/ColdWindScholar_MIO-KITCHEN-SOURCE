@@ -1,0 +1,2391 @@
+import gzip
+import logging
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+import zipfile
+from contextlib import suppress
+from shutil import copy
+
+from src.core import contextpatch
+from src.core import extra
+from src.core import fspatch
+from src.core import tarsafe
+from src.core.cpio import repack as cpio_repack
+from src.core.rsceutil import repack as rsceutil_repack
+from src.core.splash_editor.main import splash_repack
+from src.core.unpac import MODE as PACMODE
+from src.qtui.log_box import LogMessageBoxBase
+
+try:
+    from cpb_file import extract as extract_cpb
+except ModuleNotFoundError:
+    pass
+from src.core import mkdtboimg
+from src.core import ofp_mtk_decrypt
+from src.core import ofp_qc_decrypt
+from src.core import opscrypto
+from src.core import ozipdecrypt
+from src.core.posix import repair_erofs_symlinks
+from src.core.ntpiutils import extractor as ntpiextractor
+from src.core.ntpiutils import parser as ntpiparser
+from src.core.undz import DZFileTools
+from src.core.unkdz import KDZFileTools
+from src.core.unpac import unpac
+
+if os.name == 'nt':
+    from ctypes import windll
+from shutil import rmtree
+from src.core.cpio import extract as cpio_extract
+from src.core.rsceutil import unpack as rsceutil_unpack
+
+from PySide6.QtCore import Qt, Signal, QObject, QPoint, QThread
+from PySide6.QtWidgets import QApplication, QVBoxLayout, QHBoxLayout, QWidget, QTableWidgetItem, QLabel, \
+    QHeaderView, QFrame, QAbstractItemView
+from qfluentwidgets import CheckBox, ComboBox, RadioButton, PushButton, ScrollArea, \
+    SearchLineEdit, FluentIcon as FIF, PrimaryPushButton, TableWidget, MessageBox, IndeterminateProgressRing, InfoBar, \
+    TransparentDropDownToolButton, FluentIcon, RoundMenu, Action, SegmentedWidget, InfoBarPosition, InfoBarIcon, \
+    MessageBoxBase, SubtitleLabel, CaptionLabel
+
+from src.core import ext4
+from src.core import imgextractor
+from src.core import lpunpack
+from src.core import splituapp
+from src.core import utils
+from src.core.payload_extract import extract_partitions_from_payload
+from src.core.pygpt.gpt_reader import GPTReader
+from src.qtui.settings import cfg
+from src.qtui.widgets import NewProjectDialog, PackSettingsDialog, ConvertImageMessageBox, \
+    PackSuperMessageBox, RepackZipMessageBox, GenericTaskWorker
+from src.core.romfs_parse import RomfsParse
+from src.core.splash_editor.src.logo_gen_decoder import process_splashimg
+from src.core.utils import gettype, call
+from src.core.aml_image import main as aml_main
+if os.name == 'nt':
+    try:
+        from src.core.pycase import ensure_dir_case_sensitive
+    except ImportError:
+        ensure_dir_case_sensitive = lambda *x: print(f'Cannot sensitive {x}, Not Supported')
+context_rule_file = os.path.join(cfg.workingFolder.value, 'bin', "context_rules.json")
+
+
+class StreamToSignal(QObject):
+    text_written = Signal(str)
+
+    def __init__(self, original_stream):
+        super().__init__()
+        self.original_stream = original_stream
+
+    def write(self, text):
+        if not text.strip():
+            return
+        logging.info(text)
+        self.text_written.emit(text)
+
+    def flush(self):
+        self.original_stream.flush()
+
+
+class Events(QObject):
+    refresh_projects = Signal()
+    refresh_list = Signal()
+    set_project_name = Signal(str)
+    show_info_bar = Signal(str, str, int, int)
+
+
+events = Events()
+
+
+class PartitionListWorker(QThread):
+    loaded = Signal(int, object, str, str)
+    failed = Signal(int, str)
+
+    def __init__(self, request_id, work, mode, form, try_formats=False, parent=None):
+        super().__init__(parent)
+        self.request_id = request_id
+        self.work = work
+        self.mode = mode
+        self.form = form
+        self.try_formats = try_formats
+
+    def run(self):
+        try:
+            entries = None
+            if self.mode == "unpack":
+                if not os.path.isdir(self.work):
+                    self.loaded.emit(self.request_id, [], self.form, "")
+                    return
+                with os.scandir(self.work) as scan:
+                    entries = [entry.name for entry in scan]
+
+            formats = [self.form]
+            if self.mode == "unpack" and self.try_formats:
+                format_order = ('new.dat.br', 'new.dat.xz', 'new.dat', 'img', 'zst',
+                                'payload', 'super', 'update.app')
+                formats = [self.form, *(form for form in format_order if form != self.form)]
+                available = set()
+                for name in entries:
+                    if name in ("payload.bin", "super.img", "UPDATE.APP"):
+                        available.add({
+                            "payload.bin": "payload",
+                            "super.img": "super",
+                            "UPDATE.APP": "update.app",
+                        }[name])
+                    for form in format_order[:5]:
+                        if name.endswith(form):
+                            available.add(form)
+                matching_formats = [form for form in formats if form in available]
+                formats = matching_formats or [self.form]
+            data = []
+            selected_form = self.form
+            warning = ""
+            for form in formats:
+                if self.isInterruptionRequested():
+                    return
+                data, warning = self._load(self.work, self.mode, form, entries)
+                selected_form = form
+                if data or not self.try_formats:
+                    break
+            if not self.isInterruptionRequested():
+                self.loaded.emit(self.request_id, data, selected_form, warning)
+        except Exception as error:
+            logging.exception("Unable to load the project partition list")
+            self.failed.emit(self.request_id, str(error))
+
+    def _load(self, work, mode, form, entries=None):
+        data = []
+        if mode == "repack":
+            if not os.path.exists(work):
+                return data, ""
+            parts_dict = utils.JsonEdit(os.path.join(work, "config", "parts_info")).read()
+            with os.scandir(work) as scan:
+                folders = [
+                    (entry.name, entry.path) for entry in scan
+                    if entry.name in parts_dict and entry.is_dir(follow_symlinks=False)
+                ]
+            for folder, path in folders:
+                if self.isInterruptionRequested():
+                    return [], ""
+                size = self._folder_size(path)
+                if size is None:
+                    return [], ""
+                data.append((
+                    folder,
+                    utils.hum_convert(size),
+                    parts_dict.get(folder, "Unknown"),
+                    "Source",
+                    "rw",
+                ))
+            return data, ""
+
+        entries = entries or []
+        if form == "payload":
+            payload_path = os.path.join(work, "payload.bin")
+            if "payload.bin" in entries:
+                with open(payload_path, "rb") as payload:
+                    for partition in utils.payload_reader(payload).partitions:
+                        if self.isInterruptionRequested():
+                            return [], ""
+                        data.append((
+                            partition.partition_name,
+                            utils.hum_convert(partition.new_partition_info.size),
+                            "Raw",
+                            "Unknown",
+                            "Unknown",
+                        ))
+        elif form == "super":
+            super_path = os.path.join(work, "super.img")
+            if "super.img" in entries:
+                if gettype(super_path) == "sparse":
+                    return data, "The image is sparse, pls convert it to raw first."
+                data.extend((name, "Unknown", "Raw", "Unknown", "Unknown")
+                            for name in lpunpack.get_parts(super_path))
+        elif form == "update.app":
+            app_path = os.path.join(work, "UPDATE.APP")
+            if "UPDATE.APP" in entries:
+                data.extend((name, "Unknown", "Raw", "Unknown", "Unknown")
+                            for name in splituapp.get_parts(app_path))
+        else:
+            for file_name in entries:
+                if self.isInterruptionRequested():
+                    return [], ""
+                if not file_name.endswith(form):
+                    continue
+                file_path = os.path.join(work, file_name)
+                file_type = gettype(file_path) if file_name.endswith(".img") else form
+                data.append((
+                    file_name[:-len(f".{form}")],
+                    utils.hum_convert(os.path.getsize(file_path)),
+                    file_type,
+                    "Image",
+                    "rw" if file_type == "ext" else "ro",
+                ))
+        return data, ""
+
+    def _folder_size(self, path):
+        size = 0
+        pending = [path]
+        while pending:
+            if self.isInterruptionRequested():
+                return None
+            current = pending.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(entry.path)
+                            elif entry.is_file(follow_symlinks=True):
+                                size += entry.stat().st_size
+                        except OSError:
+                            logging.exception("Unable to read partition file metadata: %s", entry.path)
+            except OSError:
+                logging.exception("Unable to scan partition directory: %s", current)
+        size += (size / 16384) * 256
+        if size > 100 * 1024 * 1024:
+            size += 16 * (1024 ** 2)
+        return size
+
+
+
+class PackHybridRom:
+    def __init__(self, right_device):
+        if os.path.exists(dir_ := os.path.join(project_manger.current_work_output_path(), "firmware-update")):
+            os.rename(f"{dir_}/firmware-update", f"{dir_}/images")
+        if not os.path.exists(f"{dir_}/images"):
+            os.makedirs(f'{dir_}/images')
+        if os.path.exists(os.path.join(project_manger.current_work_output_path(), 'payload.bin')):
+            print("Found payload.bin ,Stop!")
+            return
+        if os.path.exists(f'{dir_}/META-INF'):
+            rmtree(f'{dir_}/META-INF')
+        shutil.copytree(f"{utils.prog_path}/bin/extra_flash", dir_, dirs_exist_ok=True)
+        with open(f"{dir_}/bin/right_device", 'w', encoding='gbk') as rd:
+            rd.write(right_device + "\n")
+        with open(
+                f'{dir_}/META-INF/com/google/android/update-binary',
+                'r+', encoding='utf-8', newline='\n') as script:
+            lines = script.readlines()
+            lines.insert(45, f'right_device="{right_device}"\n')
+            add_line = self.get_line_num(lines, '#Other images')
+            for t in os.listdir(f"{dir_}/images"):
+                dir_t = os.path.join(dir_, t)
+                if t.endswith('.img') and not os.path.isdir(dir_t):
+                    print(f"Add Flash method {t} to update-binary")
+                    if os.path.getsize(os.path.join(f'{dir_}/images', t)) > 209715200:
+                        self.zstd_compress(os.path.join(f'{dir_}/images', t))
+                        lines.insert(add_line,
+                                     f'package_extract_zstd "images/{t}.zst" "/dev/block/by-name/{t[:-4]}"\n')
+                    else:
+                        lines.insert(add_line,
+                                     f'package_extract_file "images/{t}" "/dev/block/by-name/{t[:-4]}"\n')
+            for t in os.listdir(dir_):
+                dir_t = os.path.join(dir_, t)
+                if not t.startswith("preloader_") and not os.path.isdir(dir_t) and t.endswith('.img'):
+                    print(f"Add Flash method {t} to update-binary")
+                    if os.path.getsize(dir_t) > 209715200:
+                        self.zstd_compress(dir_t)
+                        shutil.move(os.path.join(dir_, f"{t}.zst"), os.path.join(f"{dir_}/images", f"{t}.zst"))
+                        lines.insert(add_line,
+                                     f'package_extract_zstd "images/{t}.zst" "/dev/block/by-name/{t[:-4]}"\n')
+                    else:
+                        lines.insert(add_line,
+                                     f'package_extract_file "images/{t}" "/dev/block/by-name/{t[:-4]}"\n')
+                        shutil.move(os.path.join(dir_, t), os.path.join(f"{dir_}/images", t))
+            script.seek(0)
+            script.truncate()
+            script.writelines(lines)
+
+    @staticmethod
+    def get_line_num(data, text):
+        for i, t_ in enumerate(data):
+            if text in t_:
+                return i
+        raise ValueError("The line u looking for isn't exist.")
+
+    @staticmethod
+    def zstd_compress(path):
+        basename = os.path.basename(path)
+        if os.path.exists(path):
+            if gettype(path) == "sparse":
+                print(f"[INFO] {basename} is (sparse), converting to (raw)")
+                utils.simg2img(path)
+            try:
+                print(f"[Compress] {basename}...")
+                call(['zstd', '-5', '--rm', path, '-o', f'{path}.zst'])
+            except Exception as e:
+                logging.exception('Bugs')
+                print(f"[Fail] Compress {basename} Fail:{e}")
+
+
+class ProjectManager:
+    def __init__(self):
+        self.hide_items = ['bin', 'src', 'readmes']
+
+    @staticmethod
+    def get_work_path(name):
+        path = str(os.path.join(cfg.workingFolder.value, name) + os.sep)
+        return path if os.name != 'nt' else path.replace('\\', '/')
+
+    def get_projects(self):
+        if not os.path.exists(cfg.workingFolder.value):
+            # fix wrong project path
+            cfg.set(cfg.workingFolder, cfg.workingFolder.defaultValue)
+        for f in os.listdir(cfg.workingFolder.value):
+            if os.path.isdir(f'{cfg.workingFolder.value}/{f}') and f not in self.hide_items and not f.startswith('.'):
+                yield f
+
+    def new(self, name: str):
+        if ' ' in name:
+            name = name.replace(" ", '_')
+        path = self.get_work_path(name)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def current_work_path(self, mkdir=False):
+        if cfg.projectStructure.value == 'Single':
+            path = self.get_work_path(cfg.currentProjectName.value)
+        else:
+            path = os.path.join(self.get_work_path(cfg.currentProjectName.value), 'Source') + os.sep
+            if not os.path.exists(path) and cfg.currentProjectName.value:
+                os.makedirs(path, exist_ok=True)
+        if mkdir:
+            os.makedirs(path, exist_ok=True)
+        return path if os.name != 'nt' else path.replace('\\', '/')
+
+    def current_origin_path(self):
+        if cfg.projectStructure.value == 'Single':
+            path = self.get_work_path(cfg.currentProjectName.value)
+        else:
+            path = os.path.join(self.get_work_path(cfg.currentProjectName.value), 'Origin') + os.sep
+            if not os.path.exists(path) and cfg.currentProjectName.value:
+                os.makedirs(path, exist_ok=True)
+        return path if os.name == 'nt' else path.replace('\\', '/')
+
+    def current_work_output_path(self):
+        if cfg.projectStructure.value == 'Single':
+            path = self.get_work_path(cfg.currentProjectName.value)
+        else:
+            path = os.path.join(self.get_work_path(cfg.currentProjectName.value), 'Output') + os.sep
+            if not os.path.exists(path) and cfg.currentProjectName.value:
+                os.makedirs(path, exist_ok=True)
+        return path if os.name != 'nt' else path.replace('\\', '/')
+
+    def exist(self, name=None):
+        current_name = name or cfg.currentProjectName.value
+        if not current_name:
+            return False
+        return os.path.exists(self.get_work_path(current_name))
+
+    def remove(self, name):
+        if not self.exist(name):
+            return True
+        else:
+            rmtree(self.get_work_path(name))
+        return not self.exist(name)
+
+    def rename(self, old_name: str, new_name: str):
+        if not self.exist(old_name):
+            return False
+        path = self.get_work_path(old_name)
+        try:
+            os.rename(path, self.get_work_path(new_name))
+        except Exception as e:
+            logging.exception('Rename')
+            return False
+        return True
+
+
+project_manger = ProjectManager()
+
+
+def unpack_boot(name: str = 'boot', boot: str | None = None, work: str | None = None):
+    if not work:
+        work = project_manger.current_work_path()
+    if not boot:
+        if not (boot := utils.findfile(f"{name}.img", work)):
+            print(f"cannot find boot:{name}")
+            return
+    if not os.path.exists(boot):
+        print(f"cannot find boot:{name}")
+        return
+    if os.path.exists(os.path.join(work, name)):
+        rmtree(os.path.join(work, name))
+        if os.path.exists(os.path.join(work, name)):
+            print(f"remove tree failed:{name}")
+            return
+    utils.re_folder(os.path.join(work, name))
+    os.chdir(os.path.join(work, name))
+    if call(['magiskboot', 'unpack', '-h', '-n', boot]) != 0:
+        print(f"Unpack {boot} Fail...")
+        os.chdir(cfg.workingFolder.value)
+        rmtree(os.path.join(work, name))
+        return
+    if os.access(f"{work}/{name}/second", os.F_OK):
+        if gettype(f"{work}/{name}/second") == 'rk_rsce':
+            print("Unpack Rk resource...")
+            rsceutil_unpack(f"{work}/{name}/second", f"{work}/{name}/second_dump", f"{work}/{name}/second_order")
+            print("Unpack Rk resource successfully...")
+    if os.access(f"{work}/{name}/ramdisk.cpio", os.F_OK):
+        comp = gettype(f"{work}/{name}/ramdisk.cpio")
+        print(f"Ramdisk is {comp}")
+        with open(f"{work}/{name}/comp", "w", encoding='utf-8') as f:
+            f.write(comp)
+        if comp != "unknown":
+            os.rename(f"{work}/{name}/ramdisk.cpio", f"{work}/{name}/ramdisk.cpio.comp")
+            if call(["magiskboot", "decompress", f'{work}/{name}/ramdisk.cpio.comp',
+                     f'{work}/{name}/ramdisk.cpio']) != 0:
+                print("Failed to decompress Ramdisk...")
+                return
+        if not os.path.exists(f"{work}/{name}/ramdisk"):
+            os.mkdir(f"{work}/{name}/ramdisk")
+        print("Unpacking Ramdisk...")
+        if cfg.cpioImpl.value == 'Python':
+            cpio_extract(os.path.join(work, name, 'ramdisk.cpio'), os.path.join(work, name, 'ramdisk'),
+                         os.path.join(work, name, 'ramdisk.txt'))
+        else:
+            os.chdir(os.path.join(work, name))
+            utils.call(['cpio', '-i', '-d', '-F', 'ramdisk.cpio', '-D', 'ramdisk'])
+            os.chdir(cfg.workingFolder.value)
+    print("Unpack Done!")
+    os.chdir(cfg.workingFolder.value)
+
+
+def logo_dump(file_path, output: str = None, output_name: str = "logo"):
+    if output is None:
+        output = project_manger.current_work_path()
+    if not os.path.exists(file_path):
+        print(f"{file_path} does not exist")
+        return False
+    utils.re_folder(os.path.join(output, output_name))
+    return utils.LogoDumper(file_path, output + output_name).unpack()
+
+
+def un_dtbo(bn: str = 'dtbo') -> None:
+    if not (dtboimg := utils.findfile(f"{bn}.img", work := project_manger.current_work_path())):
+        print(f"cannot find dtbo {bn}")
+        return
+    utils.re_folder(f"{work}/{bn}")
+    utils.re_folder(f"{work}/{bn}/dtbo")
+    utils.re_folder(f"{work}/{bn}/dts")
+    try:
+        mkdtboimg.dump_dtbo(dtboimg, f"{work}/{bn}/dtbo/dtbo")
+    except Exception as e:
+        logging.exception("Bugs")
+        print("making dtbo failed", e)
+        return
+    for dtbo in os.listdir(f"{work}/{bn}/dtbo"):
+        if dtbo.startswith("dtbo."):
+            print(f"Decompile {dtbo}")
+            utils.call(
+                exe=['dtc', '-@', '-I', 'dtb', '-O', 'dts', f'{work}/{bn}/dtbo/{dtbo}', '-o',
+                     os.path.join(work, bn, 'dts', 'dts.' + os.path.basename(dtbo).rsplit('.', 1)[1])],
+                out=False)
+    print(f"Unpack {bn} Done")
+    try:
+        os.remove(dtboimg)
+    except (Exception, BaseException):
+        logging.exception('Bugs')
+    rmtree(f"{work}/dtbo/dtbo")
+
+
+class PartitionDetailsDialog(MessageBoxBase):
+    def __init__(self, details: list[tuple[str, str]], ext4_details: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+
+        self.title_label = SubtitleLabel(self.tr("Partition details"), self)
+        self.viewLayout.addWidget(self.title_label)
+        self.viewLayout.addWidget(CaptionLabel(
+            self.tr("Image and filesystem metadata for this partition."), self))
+        self.viewLayout.setSpacing(12)
+
+        sections = QWidget(self)
+        sections_layout = QHBoxLayout(sections)
+        sections_layout.setContentsMargins(0, 0, 0, 0)
+        sections_layout.setSpacing(16)
+        sections_layout.addWidget(self._create_section(self.tr("Overview"), details), 1)
+        if ext4_details:
+            sections_layout.addWidget(
+                self._create_section(self.tr("Ext4 filesystem"), ext4_details), 1)
+        self.viewLayout.addWidget(sections)
+
+        self.yesButton.setText(self.tr("Close"))
+        self.cancelButton.hide()
+        self.widget.setMinimumWidth(620)
+        self.widget.setMaximumHeight(720)
+
+    def _create_section(self, title: str, rows: list[tuple[str, str]]) -> QWidget:
+        section = QWidget(self)
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(SubtitleLabel(title, section))
+        layout.addWidget(self._create_table(rows))
+        return section
+
+    def _create_table(self, rows: list[tuple[str, str]]) -> TableWidget:
+        table = TableWidget(self)
+        table.setColumnCount(2)
+        table.setRowCount(len(rows))
+        table.setHorizontalHeaderLabels([self.tr("Property"), self.tr("Value")])
+        table.verticalHeader().hide()
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, target=table: self._show_item_context_menu(target, pos))
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.setMinimumWidth(260)
+        for row, (label, value) in enumerate(rows):
+            table.setItem(row, 0, QTableWidgetItem(label))
+            table.setItem(row, 1, QTableWidgetItem(value))
+        table.setMaximumHeight(min(320, table.verticalHeader().defaultSectionSize() * (len(rows) + 1)))
+        return table
+
+    def _show_item_context_menu(self, table: TableWidget, pos: QPoint):
+        item = table.itemAt(pos)
+        if item is None:
+            return
+
+        table.setCurrentCell(item.row(), item.column())
+        property_item = table.item(item.row(), 0)
+        value_item = table.item(item.row(), 1)
+        menu = RoundMenu(parent=table)
+
+        copy_cell_action = Action(FIF.COPY, self.tr("Copy cell"))
+        copy_cell_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(item.text()))
+        menu.addAction(copy_cell_action)
+
+        if property_item is not None and value_item is not None:
+            copy_row_action = Action(FIF.COPY, self.tr("Copy property and value"))
+            copy_row_action.triggered.connect(lambda: QApplication.clipboard().setText(
+                f"{property_item.text()}: {value_item.text()}"))
+            menu.addAction(copy_row_action)
+
+        selected_rows = table.selectionModel().selectedRows()
+        if len(selected_rows) > 1:
+            copy_selected_action = Action(FIF.COPY, self.tr("Copy selected rows"))
+            copy_selected_action.triggered.connect(lambda: QApplication.clipboard().setText(
+                "\n".join(
+                    f"{table.item(index.row(), 0).text()}: {table.item(index.row(), 1).text()}"
+                    for index in table.selectionModel().selectedRows()
+                    if table.item(index.row(), 0) is not None and table.item(index.row(), 1) is not None
+                )))
+            menu.addAction(copy_selected_action)
+
+        menu.exec(table.mapToGlobal(pos))
+
+
+class ProjectsPage(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ProjectsPage")
+        self._partition_load_id = 0
+        self._partition_list_workers = set()
+        self._applying_partition_format = False
+        self.initUI()
+
+    def initUI(self):
+        # 1. 基础布局与极简深色背景
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 使用 QFluentWidgets 原生滚动区域
+        scroll_area = ScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_log_area = ScrollArea(self)
+        scroll_log_area.setWidgetResizable(True)
+        scroll_log_area.setFixedWidth(250)
+
+        main_layout.addWidget(scroll_log_area)
+        main_layout.addWidget(scroll_area)
+
+        # 核心滚动容器
+        scroll_content = QWidget()
+        self.scroll_log_content = LogMessageBoxBase(self)
+        self.scroll_layout = QVBoxLayout(scroll_content)
+
+        # 【关键优化：增加顶部与四周间距】把原本紧凑的区域整体下调，留出透气的空间
+        self.scroll_layout.setContentsMargins(32, 40, 32, 32)
+        self.scroll_layout.setSpacing(10)  # 模块与模块之间拉开足够的高级感间距
+        scroll_area.setWidget(scroll_content)
+        scroll_log_area.setWidget(self.scroll_log_content)
+
+        # 2. 依次构建去背景、去卡片的扁平化模块
+        self._build_partition_section(scroll_content)
+        self._build_tools_section(scroll_content)
+
+        # 底层弹性推力
+        self.scroll_layout.addStretch(1)
+        self.setAcceptDrops(True)
+        self.initDropOverlay()
+        self.setStyleSheet("background: transparent")
+        # set events
+        events.refresh_projects.connect(self.refresh_projects)
+        events.refresh_list.connect(self.refresh_list)
+        events.show_info_bar.connect(self.show_info_bar)
+
+    def initDropOverlay(self):
+        """Creates a hidden, full-window overlay that alerts 'Drop Here' on drag move."""
+        self.drop_overlay = QLabel(self.tr("Drop Here"), self)
+        self.drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Modern semi-transparent dark tint design with a high-contrast accent border
+        self.drop_overlay.setStyleSheet("""
+            QLabel {
+                background-color: rgba(28, 28, 28, 0.85);
+                color: #0078d4;
+                font-size: 24px;
+                font-weight: bold;
+                border: 2px dashed #0078d4;
+                border-radius: 12px;
+            }
+        """)
+        self.drop_overlay.hide()
+
+    def resizeEvent(self, event):
+        """Ensures the drop overlay always scales to cover the exact canvas area."""
+        super().resizeEvent(event)
+        self.drop_overlay.setGeometry(0, 0, self.width(), self.height())
+
+    def dragEnterEvent(self, event):
+        """Triggers immediately when a file boundary crosses over the window application edge."""
+        # Validate that the object being dragged actually contains external file paths
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()  # Acknowledge copy/move acceptance
+            self.drop_overlay.show()  # Flash the visual 'Drop Here' target overlay
+            self.drop_overlay.raise_()  # Bring to front layer
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        """Hides the target overlay instantly if the cursor exits the window geometry frame."""
+        self.drop_overlay.hide()
+        event.accept()
+
+    def dropEvent(self, event):
+        """Executes processing workflows once the file gets physically dropped down."""
+        self.drop_overlay.hide()  # Clear overlay canvas
+
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+            # Extract local system file paths out of the mime data collection array
+            urls = event.mimeData().urls()
+            file_paths = [url.toLocalFile() for url in urls]
+
+            if file_paths:
+                # Call file target router processor
+                self.dndfile(file_paths)
+
+    def script2fs(self, path: str):
+        if os.path.exists(os.path.join(path, "system", "app")):
+            if not os.path.exists(f"{path}/config"):
+                os.makedirs(f"{path}/config")
+            extra.script2fs_context(utils.findfile("updater-script", f"{path}/META-INF"), f"{path}/config", path)
+            json_ = utils.JsonEdit(os.path.join(path, "config", "parts_info"))
+            parts = json_.read()
+            for v in os.listdir(path):
+                if os.path.exists(f"{path}/config/{v}_fs_config"):
+                    if v not in parts.keys():
+                        parts[v] = 'ext'
+            json_.write(parts)
+
+    def unpackrom(self, ifile: str) -> None:
+        print(f"Unpacking {ifile}", f'Type:[{(ftype := gettype(ifile))}]')
+        # gzip
+        if ftype == 'gzip':
+            name = os.path.splitext(os.path.basename(ifile))[0]
+            cfg.set(cfg.currentProjectName, name)
+            events.set_project_name.emit(name)
+            if not project_manger.exist(name):
+                utils.re_folder(project_manger.current_work_path())
+            output_file_name = os.path.basename(ifile)
+            if ifile.endswith(".gz"):
+                output_file_name = output_file_name[:-3]
+
+            output_file_ = os.path.join(project_manger.current_work_path(), output_file_name)
+            with open(output_file_, "wb") as output, gzip.open(ifile, "rb") as input_file:
+                data = input_file.read(8192)
+                while len(data) == 8192:
+                    output.write(data)
+                    data = input_file.read(8192)
+                else:
+                    if len(data) > 0:
+                        output.write(data)
+            old_project_name = os.path.splitext(os.path.basename(ifile))[0]
+            self.unpackrom(output_file_)
+            if old_project_name != (new_project_name := cfg.currentProjectName.value):
+                project_manger.remove(old_project_name)
+                events.refresh_projects.emit()
+            cfg.set(cfg.customProjectName, new_project_name)
+            return
+        # ozip
+        if ftype == "ozip":
+            print(f"Decrypting {ifile}")
+            ozipdecrypt.main(ifile)
+            decrypted = os.path.join(os.path.dirname(ifile), os.path.basename(ifile)[:-4] + ".zip")
+            if not os.path.exists(decrypted):
+                events.show_info_bar.emit(self.tr("Error"), f"{ifile} decrypt Fail!!!", 1, 3000)
+                return
+            self.unpackrom(decrypted)
+            try:
+                os.remove(decrypted)
+            except:
+                print(f"{ifile} remove Fail!!!")
+            return
+        # tar
+        if ftype == 'tar':
+            cfg.set(cfg.currentProjectName, os.path.splitext(os.path.basename(ifile))[0])
+            if not project_manger.exist():
+                utils.re_folder(project_manger.current_work_path())
+            with tarsafe.TarSafe(ifile) as f:
+                f.extractall(project_manger.current_work_path())
+            return
+        # kdz
+        if ftype == 'kdz':
+            cfg.set(cfg.currentProjectName, os.path.splitext(os.path.basename(ifile))[0])
+            if not project_manger.exist():
+                utils.re_folder(project_manger.current_work_path())
+            KDZFileTools(ifile, project_manger.current_work_path(), extract_all=True)
+            for i in os.listdir(project_manger.current_work_path()):
+                file = os.path.join(project_manger.current_work_path(), i)
+                if not os.path.isfile(file):
+                    continue
+                if i.endswith('.dz') and gettype(file) == 'dz':
+                    DZFileTools(file, project_manger.current_work_path(),
+                                extract_all=True)
+            return
+        # ofp
+        if os.path.splitext(ifile)[1] == '.ofp':
+            project_name = os.path.splitext(os.path.basename(ifile))[0]
+            cfg.set(cfg.currentProjectName, project_name)
+            project_manger.new(project_name)
+            events.set_project_name.emit(project_name)
+            try:
+                ofp_qc_decrypt.main(ifile, project_manger.current_work_path())
+            except:
+                ofp_mtk_decrypt.main(ifile, project_manger.current_work_path())
+            events.refresh_projects.emit()
+            return
+        # ops
+        if os.path.splitext(ifile)[1] == '.ops':
+            cfg.set(cfg.currentProjectName, os.path.basename(ifile).split('.')[0])
+            args = {'decrypt': True,
+                    "<filename>": ifile,
+                    'outdir': os.path.join(cfg.workingFolder.value, project_manger.current_work_path())}
+            opscrypto.main(args)
+            events.refresh_projects.emit()
+            return
+        # pac
+        ftype = gettype(ifile)
+        if ftype == 'pac':
+            cfg.set(cfg.currentProjectName, os.path.splitext(os.path.basename(ifile))[0])
+            unpac(ifile, project_manger.current_work_path(), PACMODE.EXTRACT)
+            events.refresh_projects.emit()
+            if cfg.autoUnpack.value:
+                self.unpack([i.split('.')[0] for i in os.listdir(project_manger.current_work_path())])
+            return
+        # NTPI
+        if ftype == 'cpb':
+            prog_name = os.path.splitext(os.path.basename(ifile))[:1]
+            cfg.set(cfg.currentProjectName, "".join(prog_name))
+            extract_cpb(ifile, project_manger.current_work_path(mkdir=True))
+            return
+        if ftype == 'NTPI':
+            prog_name = os.path.splitext(os.path.basename(ifile))[0]
+            cfg.set(cfg.currentProjectName, prog_name)
+            ntpiparser.parse_ntpi_file(ifile, project_manger.current_work_path(mkdir=True))
+            ntpiextractor.stage2_extract_files(project_manger.current_work_path(), project_manger.current_work_path())
+            return
+        # zip
+        if ftype == 'zip':
+            project_name = os.path.splitext(os.path.basename(ifile))[0]
+            cfg.set(cfg.currentProjectName, project_name)
+            with zipfile.ZipFile(ifile, 'r') as fz:
+                if len(fz.namelist()) == 1:
+                    for fi in fz.namelist():
+                        print(f"Extracting {fi}")
+                        try:
+                            fz.extract(fi, utils.temp)
+                        except Exception as e:
+                            print("cannot rename %s %s" % (fi, e))
+                    self.unpackrom(os.path.join(utils.temp, fi))
+                    os.remove(os.path.join(utils.temp, fi))
+                    return
+                for fi in fz.namelist():
+                    try:
+                        member_name = fi.encode('cp437').decode('gbk')
+                    except (Exception, BaseException):
+                        try:
+                            member_name = fi.encode('cp437').decode('utf-8')
+                        except (Exception, BaseException):
+                            member_name = fi
+                    print(f"Extracting {member_name}")
+                    try:
+                        fz.extract(fi, project_manger.current_work_path())
+                        if fi != member_name:
+                            os.rename(os.path.join(project_manger.current_work_path(), fi),
+                                      os.path.join(project_manger.current_work_path(), member_name))
+                    except Exception as e:
+                        print("cannot rename %s %s" % (member_name, e))
+                print("unzip done")
+                self.script2fs(project_manger.current_work_path())
+            events.refresh_projects.emit()
+            events.set_project_name.emit(project_name)
+            events.refresh_list.emit()
+            if cfg.autoUnpack:
+                self.unpack([i.split('.')[0] for i in os.listdir(project_manger.current_work_path())])
+            return
+
+        # othters.
+        if ftype != 'unknown':
+            file_name: str = os.path.basename(ifile)
+            base_name = os.path.splitext(file_name)[0]
+            project_folder = os.path.join(cfg.workingFolder.value, base_name)
+            if os.path.exists(project_folder):
+                base_name += utils.v_code()
+                folder = os.path.join(cfg.workingFolder.value,
+                                      base_name)
+            else:
+                folder = project_folder
+            try:
+                cfg.set(cfg.currentProjectName, base_name)
+                os.mkdir(folder)
+                project_manger.current_work_path()
+                project_manger.current_work_output_path()
+                events.refresh_projects.emit()
+                events.set_project_name.emit(base_name)
+                events.refresh_list.emit()
+            except Exception as e:
+                raise e
+            project_dir = str(folder) if cfg.projectStructure.value != 'Split' else str(f'{folder}/Source/')
+            copy(ifile, project_dir)
+            # File Rename
+            if os.path.exists(os.path.join(project_dir, file_name)):
+                if not '.' in file_name:
+                    shutil.move(os.path.join(project_dir, file_name), os.path.join(project_dir, f"{file_name}.img"))
+                if (file_name.endswith(".bin") or file_name.endswith(".IMG") or file_name.endswith(".BIN")) and gettype(os.path.join(project_dir, file_name)) != 'payload':
+                    shutil.move(os.path.join(project_dir, file_name),
+                                os.path.join(project_dir, file_name[:-4] + ".img"))
+            cfg.set(cfg.currentProjectName, base_name)
+            events.set_project_name.emit(base_name)
+            events.refresh_list.emit()
+            if cfg.autoUnpack.value:
+                self.unpack([i.split('.')[0] for i in os.listdir(project_manger.current_work_path())])
+        else:
+            events.show_info_bar.emit(self.tr("Warning"), "Unsupported %s [%s]" % (ifile, ftype), 2, 3000)
+        events.refresh_list.emit()
+
+    def copy_project(self, dir_path: str):
+        name = os.path.basename(dir_path)
+        print("Copying ", name)
+        if not os.path.exists(dir_path):
+            print(self.tr('No Such Folder.'))
+            return 1
+        if os.path.isfile(dir_path):
+            return self.unpackrom(dir_path)
+        if os.path.exists(project_manger.get_work_path(name)) and os.path.samefile(project_manger.get_work_path(name),
+                                                                                   os.path.abspath(dir_path)):
+            events.show_info_bar.emit(self.tr('Error'), self.tr("The same project exists already."), 2, 3000)
+            return 1
+
+        if project_manger.exist(name):
+            name += utils.v_code()
+        project_path = project_manger.new(name)
+        cfg.set(cfg.currentProjectName, name)
+        events.refresh_projects.emit()
+        events.set_project_name.emit(name)
+        shutil.copytree(dir_path, project_path, dirs_exist_ok=True)
+        return 0
+
+    def pack_dtbo(self) -> bool:
+        work = project_manger.current_work_path()
+        if not os.path.exists(f"{work}/dtbo/dts") or not os.path.exists(f"{work}/dtbo"):
+            print("no source find")
+            return False
+        utils.re_folder(f"{work}/dtbo/dtbo")
+        for dts in os.listdir(f"{work}/dtbo/dts"):
+            if dts.startswith("dts."):
+                print(f"Compling:{dts}")
+                call(
+                    exe=['dtc', '-@', '-I', 'dts', '-O', 'dtb', os.path.join(work, 'dtbo', 'dts', dts), '-o',
+                         os.path.join(work, 'dtbo', 'dtbo', 'dtbo.' + os.path.basename(dts).rsplit('.', 1)[1])],
+                    out=False)
+        print("Generating:dtbo.img")
+        list_ = [os.path.join(work, "dtbo", "dtbo", f) for f in os.listdir(f"{work}/dtbo/dtbo") if
+                 f.startswith("dtbo.")]
+        mkdtboimg.create_dtbo(os.path.join(project_manger.current_work_output_path(), "dtbo.img"),
+                              sorted(list_, key=lambda x: int(x.rsplit('.')[1])), 4096)
+        rmtree(f"{work}/dtbo")
+        print("Pack dtbo done")
+        return True
+
+    def dndfile(self, files: list):
+        self.dnd_task = None
+        for fi in files:
+            if fi.endswith('}') and fi.startswith('{'):
+                fi = fi[1:-1]
+            try:
+                if hasattr(fi, 'decode'):
+                    fi = fi.decode('gbk')
+            except (Exception, BaseException):
+                logging.exception('Decode file name')
+                return 1
+            if os.path.exists(fi):
+                if os.path.isfile(fi):
+                    self.dnd_task = GenericTaskWorker(self.unpackrom, fi)
+                elif os.path.isdir(fi):
+                    self.dnd_task = GenericTaskWorker(self.copy_project, fi)
+            else:
+                print(self.tr("file not exist"))
+            if not self.dnd_task:
+                return
+            self.start_job(self.dnd_task)
+
+    def refresh_list(self):
+        self._schedule_partition_list_load(try_formats=self.unpack_rb.isChecked())
+        return
+
+
+    def refresh_projects(self):
+        was_blocked = self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+        projects = project_manger.get_projects()
+        self.project_combo.addItems(projects)
+        if projects:
+            self.project_combo.setCurrentIndex(0)
+            self.project_combo.blockSignals(was_blocked)
+            self._on_project_changed(self.project_combo.currentText())
+        else:
+            self.project_combo.blockSignals(was_blocked)
+            cfg.set(cfg.currentProjectName, '')
+            cfg.save()
+            self.refresh_list()
+
+    def open_dir(self):
+        name = self.project_combo.currentText()
+        if not name:
+            self.show_info_bar(self.tr("Warning"), self.tr("Please select a project."), 2)
+            return 
+        if not project_manger.exist(name):
+            self.show_info_bar(self.tr("Warning"), self.tr("Cannot open folder:\n{}").format(name), 2)
+            return
+
+        path = project_manger.get_work_path(name)
+        if not path or not os.path.exists(path):
+            self.show_info_bar(self.tr("Warning"), self.tr("Cannot open folder:\n{}").format(path), 2)
+            return
+
+        try:
+            path = os.path.normpath(path)
+            if os.name == 'nt':
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except Exception:
+            self.show_info_bar(self.tr("Warning"), self.tr("Cannot open folder:\n{}").format(path), 2)
+
+    def show_create_dialog(self):
+        """显示创建项目对话框"""
+        dialog = NewProjectDialog(
+            title=self.tr("New Project"),
+            existing_projects=list(project_manger.get_projects()),
+            parent=self.parent()
+        )
+        if dialog.exec():
+            project_name = dialog.nameLineEdit.text().strip()
+            project_manger.new(project_name)
+            self.refresh_projects()
+
+    def show_rename_dialog(self):
+        """显示创建项目对话框"""
+        project_name = cfg.currentProjectName.value
+        if not project_name or not self.project_combo.currentText():
+            self.show_info_bar(self.tr("Warning"), self.tr("Select a project first"), bar_type=2)
+            return
+        origin_name = self.project_combo.currentText()
+        dialog = NewProjectDialog(
+            title=self.tr("Rename Project"),
+            existing_projects=list(project_manger.get_projects()),
+            initial_text=origin_name,
+            parent=self.parent()
+        )
+        if dialog.exec():
+            project_name = dialog.nameLineEdit.text().strip()
+            project_manger.rename(origin_name, project_name)
+            self.refresh_projects()
+
+    def ask_window(self, title, content):
+        result = MessageBox(
+            title,
+            content,
+            self
+        ).exec()
+        return result != 1
+
+    def delete_project(self):
+        """删除选中的项目并显示提示"""
+        project_name = cfg.currentProjectName.value
+        if not project_name or not self.project_combo.currentText():
+            self.show_info_bar(self.tr("Warning"), self.tr("Select a project first"), bar_type=2)
+            return
+
+        result = MessageBox(
+            self.tr('Confirm Delete'),
+            self.tr("Remove '{}' ?").format(project_name),
+            parent=self.parent()
+        ).exec()
+
+        if result != 1:
+            return
+
+        try:
+            project_manger.remove(project_name)
+            self.show_info_bar(self.tr("Success"), self.tr("Project {} Removed.").format(project_name),
+                               bar_type=3)
+        except Exception as e:
+            self.show_info_bar(self.tr("Error"), self.tr("Failed to remove peoject: {}").format(e),
+                               bar_type=1)
+        self.refresh_projects()
+
+    def build_project_section(self, parent):
+        self.project_container = QWidget(parent)
+        layout = QVBoxLayout(self.project_container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        # 下半部分控件区域
+        row1 = QHBoxLayout()
+        self.project_combo = ComboBox(self.project_container)
+        cfg.currentProjectName.valueChanged.connect(self.project_combo.setText)
+        events.set_project_name.connect(self._on_project_changed)
+        self.project_combo.setMinimumWidth(250)
+        self.project_combo.setPlaceholderText(self.tr("No Project Available"))
+        self.project_combo.addItems(project_manger.get_projects())
+        self.project_combo.currentTextChanged.connect(self._on_project_changed)
+        self.open_btn = PushButton(self.tr("Open"), self.project_container, FIF.FOLDER)
+        self.open_btn.clicked.connect(self.open_dir)
+        self.moreButton = TransparentDropDownToolButton(FluentIcon.MORE)
+        row1.addWidget(self.project_combo, 1)
+        row1.addWidget(self.open_btn)
+        row1.addWidget(self.moreButton)
+        layout.addLayout(row1)
+
+        menu = RoundMenu(parent=self.moreButton)
+        menu.addAction(Action(FluentIcon.ADD, self.tr('New'), triggered=self.show_create_dialog))
+        menu.addAction(Action(FluentIcon.SYNC, self.tr('Refresh'), triggered=self.refresh_projects))
+        menu.addAction(Action(FluentIcon.EDIT, self.tr('Rename'), triggered=self.show_rename_dialog))
+        menu.addAction(Action(FluentIcon.DELETE, self.tr('Delete'), triggered=self.delete_project))
+        menu.addAction(Action(FluentIcon.ZIP_FOLDER, self.tr("Pack Zip"), triggered=self.pack_zip))
+        # Add menu
+        self.moreButton.setMenu(menu)
+
+        return self.project_container
+
+    def _on_project_changed(self, project_name: str):
+        cfg.set(cfg.currentProjectName, project_name)
+        self.refresh_list()
+
+    def _schedule_partition_list_load(self, try_formats=False):
+        self._partition_load_id += 1
+        request_id = self._partition_load_id
+        for worker in tuple(self._partition_list_workers):
+            if worker.isRunning():
+                worker.requestInterruption()
+
+        mode = "unpack" if self.unpack_rb.isChecked() else "repack"
+        form = self.format_widget.currentItem().text() if mode == "unpack" else ""
+        work = project_manger.current_work_path()
+        self.partition_table.setRowCount(0)
+        worker = PartitionListWorker(request_id, work, mode, form, try_formats, self)
+        self._partition_list_workers.add(worker)
+        worker.loaded.connect(self._apply_partition_list)
+        worker.failed.connect(self._partition_list_load_failed)
+        worker.finished.connect(lambda worker=worker: self._partition_list_workers.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _apply_partition_list(self, request_id, data, form, warning):
+        if request_id != self._partition_load_id:
+            return
+        if self.unpack_rb.isChecked() and form != self.format_widget.currentItem().text():
+            self._applying_partition_format = True
+            try:
+                self.format_widget.setCurrentItem(form)
+            finally:
+                self._applying_partition_format = False
+        self._load_mock_partitions_table(data)
+        if warning:
+            events.show_info_bar.emit(self.tr("Warning"), self.tr(warning), 2, 3500)
+
+    def _partition_list_load_failed(self, request_id, error):
+        if request_id == self._partition_load_id:
+            self.show_info_bar(
+                self.tr("Error"),
+                self.tr("Failed to refresh partition list: {}").format(error),
+                bar_type=1,
+            )
+
+    def _build_partition_section(self, parent_widget):
+        """分区控制模块：标题完全独立，仅保留核心高级列表的内部深色背板"""
+        container = QWidget(parent_widget)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        frame = QHBoxLayout()
+        frame.addWidget(QLabel(self.tr("Partition(s)")))
+        self.format_widget = SegmentedWidget(container)
+        for c in ['new.dat.br', 'new.dat.xz', "new.dat", 'img', 'zst', 'payload', 'super',
+                  'update.app']:
+            self.format_widget.addItem(c, c, onClick=self.refresh_unpack)
+        self.format_widget.setCurrentItem("new.dat.br")
+        layout.addWidget(self.format_widget)
+        self.ring = IndeterminateProgressRing(self)
+        self.ring.setFixedSize(16, 16)
+        self.ring.hide()
+        self.execute_btn = PrimaryPushButton(self.tr("Execute"), container, FIF.PLAY)
+        self.execute_btn.clicked.connect(self.exec_opera)
+        self.execute_btn.setFixedWidth(100)
+        frame.addWidget(self.ring)
+        frame.addWidget(self.execute_btn)
+        layout.addLayout(frame)
+
+        self.partition_table = TableWidget(container)
+        self.partition_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.partition_table.setColumnCount(5)
+        self.partition_table.setMinimumHeight(370)
+        self.partition_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.partition_table.customContextMenuRequested.connect(self.show_right_click_menu)
+
+        self.partition_table.verticalHeader().setVisible(False)
+        self.partition_table.setSelectionBehavior(TableWidget.SelectRows)
+        self.partition_table.itemChanged.connect(self._sync_select_all_partitions)
+        self.partition_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 5):
+            self.partition_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        layout.addWidget(self.partition_table)
+
+        row1 = QHBoxLayout()
+        self.select_all_cb = CheckBox(self.tr("Select All"), container)
+        self.select_all_cb.stateChanged.connect(self._toggle_select_all_partitions)
+        self.filter_input = SearchLineEdit(container)
+        self.filter_input.setPlaceholderText(self.tr("Search partitions..."))
+        self.filter_input.textChanged.connect(self.filter_tabview)
+        self.filter_input.setFixedWidth(230)
+
+        self.partition_table.setHorizontalHeaderLabels(
+            [self.tr("NAME"), self.tr("SIZE"), self.tr("FS"), self.tr("IMAGE"), self.tr("ATTRIBUTES")])
+        self.unpack_rb = RadioButton(self.tr("Unpack"), container)
+        self.pack_rb = RadioButton(self.tr("Repack"), container)
+        self.unpack_rb.clicked.connect(self.refresh_unpack)
+        self.pack_rb.clicked.connect(self.refresh_repack)
+        self.unpack_rb.setChecked(True)
+        row1.addWidget(self.select_all_cb)
+        row1.addWidget(self.pack_rb)
+        row1.addWidget(self.unpack_rb)
+        row1.addWidget(self.filter_input)
+        layout.addLayout(row1)
+
+        self.scroll_layout.addWidget(container)
+
+    def show_right_click_menu(self, pos: QPoint):
+        item = self.partition_table.itemAt(pos)
+        if not item:
+            return
+
+        row = self.partition_table.row(item)
+        name_item = self.partition_table.item(row, 0)
+        if name_item is None:
+            return
+
+        name = name_item.text()
+        menu = RoundMenu(parent=self.partition_table)
+        if self.unpack_rb.isChecked():
+            image_action = Action(FIF.PLAY, self.tr('Unpack {}').format(name), self)
+            image_action.triggered.connect(lambda: self._unpack_partition_from_menu(name))
+        else:
+            image_action = Action(FIF.EMBED, self.tr('Pack {}').format(name), self)
+            image_action.triggered.connect(lambda: self._pack_partition_from_menu(name))
+        image_action.setEnabled(self.execute_btn.isEnabled())
+
+
+        info_action = Action(FIF.INFO, self.tr('View Details'), self)
+        info_action.triggered.connect(lambda: self._show_partition_details(row))
+        remove_action = Action(FIF.DELETE, self.tr('Remove'), self)
+        remove_action.triggered.connect(lambda: self._remove_partition_from_disk(name))
+        if self.unpack_rb.isChecked() and self.format_widget.currentItem().text() in (
+                'payload', 'super', 'update.app'):
+            remove_action.setEnabled(False)
+            remove_action.setToolTip(self.tr("Partitions inside this container cannot be deleted individually"))
+
+        menu.addAction(image_action)
+        menu.addAction(info_action)
+        menu.addSeparator()
+        menu.addAction(remove_action)
+
+        menu.exec(self.partition_table.mapToGlobal(pos))
+
+    def _remove_partition_from_disk(self, name: str):
+        work = os.path.abspath(project_manger.current_work_path())
+        if self.unpack_rb.isChecked():
+            form = self.format_widget.currentItem().text()
+            target = os.path.abspath(os.path.join(work, f"{name}.{form}"))
+        else:
+            target = os.path.abspath(os.path.join(work, name))
+
+        if os.path.dirname(target) != work:
+            self.show_info_bar(self.tr("Error"), self.tr("Invalid partition path"), bar_type=1)
+            return
+        if not os.path.lexists(target):
+            self.show_info_bar(self.tr("Warning"), self.tr("File does not exist: {}").format(target), bar_type=2)
+            return
+
+        result = MessageBox(
+            self.tr("Confirm Delete"),
+            self.tr("Delete '{}' from disk?").format(os.path.basename(target)),
+            parent=self
+        ).exec()
+        if result != 1:
+            return
+
+        try:
+            if os.path.islink(target) or not os.path.isdir(target):
+                os.remove(target)
+            else:
+                rmtree(target)
+        except OSError as error:
+            self.show_info_bar(self.tr("Error"), self.tr("Failed to delete '{}': {}").format(target, error),
+                               bar_type=1)
+            return
+
+        self.refresh_list()
+
+    def _unpack_partition_from_menu(self, name: str):
+        self.my_task_worker = GenericTaskWorker(
+            self.unpack, [name], self.format_widget.currentItem().text())
+        self.start_job(self.my_task_worker)
+
+    def _pack_partition_from_menu(self, name: str):
+        dialog = PackSettingsDialog(self)
+        if not dialog.exec():
+            return
+
+        self.my_task_worker = GenericTaskWorker(
+            self.packrom,
+            [name],
+            dialog.format_combo.currentText(),
+            dialog.sw_vbmeta.isChecked(),
+            dialog.sw_convert.isChecked(),
+            dialog.src_fs_combo.currentText(),
+            dialog.dest_fs_combo.currentText(),
+            dialog.sw_delete.isChecked(),
+            dialog.compress_algo_combo.currentText(),
+            dialog.erofs_slider.value(),
+            dialog.support_old_kernel_switch.isChecked(),
+            dialog.utc_input.text(),
+            dialog.f2fs_readonly_switch.isChecked(),
+            dialog.f2fs_compress_switch.isChecked(),
+            dialog.pack_method_combo.currentText(),
+            dialog.brotli_slider.value(),
+            dialog.size_handle_combo.currentText() == self.tr("Origin Size"),
+        )
+        self.start_job(self.my_task_worker)
+
+    def _show_partition_details(self, row: int):
+        labels = (self.tr("Name"), self.tr("Size"), self.tr("File system"),
+                  self.tr("Image type"), self.tr("Attributes"))
+        values = [
+            self.partition_table.item(row, column).text()
+            if self.partition_table.item(row, column)
+            else self.partition_table.cellWidget(row, column).text()
+            if self.partition_table.cellWidget(row, column)
+            else self.tr("Unknown")
+            for column in range(len(labels))
+        ]
+        details = list(zip(labels, values))
+        details.append((self.tr("Operation"), self.format_widget.currentItem().text()))
+
+        ext4_details = []
+        image_path = os.path.join(project_manger.current_work_path(), f"{values[0]}.img")
+        if values[2].lower() in ("ext", "ext2", "ext3", "ext4") and os.path.isfile(image_path):
+            try:
+                with open(image_path, "rb") as image:
+                    ext4_details = [
+                        (str(key), str(value)) for key, value in ext4.Volume(image).get_info_list
+                    ]
+            except (OSError, ext4.Ext4Error, ValueError) as error:
+                ext4_details = [(self.tr("Metadata unavailable"), str(error))]
+
+        PartitionDetailsDialog(details, ext4_details, self).exec()
+
+    def _toggle_select_all_partitions(self, state):
+        """Toggles check state of all visible rows based on the Select All checkbox."""
+        target_state = Qt.CheckState.Checked if state == Qt.CheckState.Checked.value else Qt.CheckState.Unchecked
+        was_blocked = self.partition_table.blockSignals(True)
+        try:
+            for row_idx in range(self.partition_table.rowCount()):
+                if not self.partition_table.isRowHidden(row_idx):
+                    name_item = self.partition_table.item(row_idx, 0)
+                    if name_item is not None:
+                        name_item.setCheckState(target_state)
+        finally:
+            self.partition_table.blockSignals(was_blocked)
+
+    def _sync_select_all_partitions(self, item):
+        if item.column() != 0:
+            return
+
+        visible_items = [
+            self.partition_table.item(row_idx, 0)
+            for row_idx in range(self.partition_table.rowCount())
+            if not self.partition_table.isRowHidden(row_idx)
+            and self.partition_table.item(row_idx, 0) is not None
+        ]
+        all_selected = bool(visible_items) and all(
+            row_item.checkState() == Qt.CheckState.Checked for row_item in visible_items
+        )
+        was_blocked = self.select_all_cb.blockSignals(True)
+        try:
+            self.select_all_cb.setChecked(all_selected)
+        finally:
+            self.select_all_cb.blockSignals(was_blocked)
+
+    #functions for it
+    def conversion(self, src_format: str, dst_format: str, selection):
+        work = project_manger.current_work_output_path()
+
+        if dst_format == src_format:
+            return
+        for i in selection:
+            print(f'[{src_format}->{dst_format}]{i}')
+            if dst_format == 'sparse':
+                basename = os.path.basename(i).split('.')[0]
+                if src_format == 'br':
+                    if os.access(f'{work}/{i}', os.F_OK):
+                        print(self.tr("Unpacking:") + i)
+                        call(['brotli', '-dj', f'{work}/{i}'])
+                if src_format == 'xz':
+                    if os.access(f'{work}/{i}', os.F_OK):
+                        print(self.tr("Unpacking:") + i)
+                        utils.Unxz(f'{work}/{i}')
+                if src_format == 'dat':
+                    if os.access(f'{work}/{i}', os.F_OK):
+                        print(self.tr("Unpacking:") + f'{work}/{i}')
+                        transferfile = os.path.abspath(
+                            os.path.dirname(work)) + f"/{basename}.transfer.list"
+                        if os.access(transferfile, os.F_OK) and os.path.getsize(f'{work}/{i}') != 0:
+                            utils.Sdat2img(transferfile, f'{work}/{i}', f"{work}/{basename}.img")
+                            if os.access(f"{work}/{basename}.img", os.F_OK):
+                                os.remove(f'{work}/{i}')
+                                os.remove(transferfile)
+                                try:
+                                    os.remove(f'{work}/{basename}.patch.dat')
+                                except (IOError, PermissionError, FileNotFoundError):
+                                    logging.exception('Bugs')
+                        else:
+                            print("transferpath is not exists")
+                    if os.path.exists(f'{work}/{basename}.img'):
+                        utils.img2simg(f'{work}/{basename}.img')
+                if src_format == 'raw':
+                    if os.path.exists(f'{work}/{basename}.img'):
+                        utils.img2simg(f'{work}/{basename}.img')
+            elif dst_format == 'raw':
+                basename = os.path.basename(i).split('.')[0]
+                if src_format == 'br':
+                    if os.access(f'{work}/{i}', os.F_OK):
+                        print(self.tr("Unpacking:") + i)
+                        call(['brotli', '-dj', f'{work}/{i}'])
+                if src_format == 'xz':
+                    if os.access(f'{work}/{i}', os.F_OK):
+                        print(self.tr("Unpacking:") + i)
+                        utils.Unxz(f'{work}/{i}')
+                if src_format in ['dat', 'br', 'xz']:
+                    if os.path.exists(work):
+                        if src_format == 'br':
+                            i = i.replace('.br', '')
+                        if src_format == 'xz':
+                            i = i.replace('.xz', '')
+                        print(self.tr("Unpacking:") + f'{work}/{i}')
+                        transferfile = os.path.abspath(
+                            os.path.dirname(work)) + f"/{basename}.transfer.list"
+                        if os.access(transferfile, os.F_OK) and os.path.getsize(f'{work}/{i}') != 0:
+                            utils.Sdat2img(transferfile, f'{work}/{i}', f"{work}/{basename}.img")
+                            if os.access(f"{work}/{basename}.img", os.F_OK):
+                                try:
+                                    os.remove(f'{work}/{i}')
+                                    os.remove(transferfile)
+                                    if not os.path.getsize(f'{work}/{basename}.patch.dat'):
+                                        os.remove(f'{work}/{basename}.patch.dat')
+                                except (PermissionError, IOError, FileNotFoundError, IsADirectoryError):
+                                    logging.exception('Bugs')
+                        else:
+                            print(f"transferfile of {basename} is not exists.")
+                if src_format == 'sparse':
+                    utils.simg2img(f'{work}/{i}')
+            elif dst_format == 'dat':
+                if src_format == 'raw':
+                    utils.img2simg(f'{work}/{i}')
+                if src_format in ['raw', 'sparse']:
+                    self.datbr(work, os.path.basename(i).split('.')[0], "dat")
+                if src_format == 'br':
+                    print(self.tr("Unpacking:") + i)
+                    call(['brotli', '-dj', f'{work}/{i}'])
+                if src_format == 'xz':
+                    print(self.tr("Unpacking:") + i)
+                    utils.Unxz(f'{work}/{i}')
+
+            elif dst_format == 'br':
+                if src_format == 'raw':
+                    utils.img2simg(f'{work}/{i}')
+                if src_format in ['raw', 'sparse']:
+                    self.datbr(work, os.path.basename(i).split('.')[0], 0)
+                if src_format in ['dat', 'xz']:
+                    if src_format == 'xz':
+                        print(self.tr("Decompressing:") + i)
+                        utils.Unxz(f'{work}/{i}')
+                        i = i.rsplit('.xz', 1)[0]
+
+                    print(f"Packing {os.path.basename(i).split('.')[0]}.new.dat.br")
+                    call(['brotli', '-q', '0', '-j', '-w', '24', f'{work}/{i}', '-o', f'{work}/{i}.br'])
+                    if os.access(f'{work}/{i}.br', os.F_OK):
+                        try:
+                            os.remove(f'{work}/{i}')
+                        except Exception:
+                            logging.exception('Bugs')
+        print(self.tr("Done!"))
+
+    def convert_image(self):
+        if not project_manger.exist(cfg.currentProjectName.value):
+            self.show_info_bar(self.tr("Warning"), self.tr("project's not exist"), 2)
+            return
+        dialog = ConvertImageMessageBox(project_manger.current_work_path(), self)
+        if dialog.exec_():
+            src, dst, files = dialog.get_result()
+            self.format_task = GenericTaskWorker(self.conversion, src, dst, files)
+            self.start_job(self.format_task)
+
+    def pack_super(self):
+        if not project_manger.exist(cfg.currentProjectName.value):
+            self.show_info_bar(self.tr("Warning"), self.tr("project's not exist"), 2)
+            return
+        dialog = PackSuperMessageBox(project_manger.current_work_path(), self)
+        if dialog.exec_():
+            self.pack_super_task = GenericTaskWorker(
+                self.pack_super_exec, dialog.switch_sparse.isChecked(),
+                dialog.show_group_name.currentText(),
+                int(dialog.super_size_edit.text()),
+                dialog.type_group.checkedId(),
+                dialog.get_selected_items(),
+                dialog.switch_delete.isChecked()
+                , "none" if dialog.attrib_group.checkedId() else "readonly", None, None, dialog._block_device_name
+            )
+            self.start_job(self.pack_super_task)
+
+    def pack_super_exec(self, sparse: bool,
+                        group_name: str, size: int,
+                        super_type, part_list: list, del_: bool = False,
+                        attrib='readonly',
+                        output_dir: str = None, work: str = None, block_device_name: str = 'None'):
+        if not block_device_name:
+            block_device_name = 'super'
+        if not work:
+            work = project_manger.current_work_path()
+        if not output_dir:
+            output_dir = project_manger.current_work_output_path()
+        lb_c = []
+        for part in part_list:
+            if part.endswith('_b') or part.endswith('_a'):
+                part = part[:-2]
+            if part not in lb_c:
+                lb_c.append(part)
+        part_list = lb_c
+        for part in part_list:
+            if not os.path.exists(f'{work}/{part}.img') and os.path.exists(f'{work}/{part}_a.img'):
+                try:
+                    os.rename(f'{work}/{part}_a.img', f'{work}/{part}.img')
+                except:
+                    logging.exception('Bugs')
+        command = ['lpmake', '--metadata-size', '65536', '-super-name', block_device_name, '-metadata-slots']
+        if super_type == 1:
+            command += ['2', '-device', f'{block_device_name}:{size}', "--group", f"{group_name}:{size}"]
+            for part in part_list:
+                command += ['--partition', f"{part}:{attrib}:{os.path.getsize(f'{work}/{part}.img')}:{group_name}",
+                            '--image', f'{part}={work}/{part}.img']
+        else:
+            command += ["3", '-device', f'super:{size}', '--group', f"{group_name}_a:{size}"]
+            for part in part_list:
+                command += ['--partition',
+                            f"{part}_a:{attrib}:{os.path.getsize(f'{work}/{part}.img')}:{group_name}_a",
+                            '--image', f'{part}_a={work + part}.img']
+            command += ["--group", f"{group_name}_b:{size}"]
+            for part in part_list:
+                if not os.path.exists(f"{work + part}_b.img"):
+                    command += ['--partition', f"{part}_b:{attrib}:0:{group_name}_b"]
+                else:
+                    command += ['--partition',
+                                f"{part}_b:{attrib}:{os.path.getsize(f'{work}/{part}_b.img')}:{group_name}_b",
+                                '--image', f'{part}_b={work}/{part}_b.img']
+            if super_type == 2:
+                command += ["--virtual-ab"]
+        if sparse: command += ["--sparse"]
+        output_super_path = f'{output_dir}/super.img'
+        command += ['--out', output_super_path]
+
+        if call(command) == 0:
+            if os.access(output_super_path, os.F_OK):
+                events.show_info_bar.emit(self.tr("Success"), self.tr("Pack Done！Output：%s") % output_super_path, 3,
+                                          3000)
+                if del_:
+                    for img in part_list:
+                        if os.path.exists(f"{work}/{img}.img"):
+                            try:
+                                os.remove(f"{work}/{img}.img")
+                            except Exception:
+                                logging.exception('Bugs')
+            else:
+                events.show_info_bar.emit(self.tr("Error"), self.tr("Failed to pack super!"), 1, 3000)
+            return 1
+        else:
+            events.show_info_bar.emit(self.tr("Error"), self.tr("Failed to pack super!"), 1, 3000)
+            return 1
+
+    def pack_zip(self):
+        if not project_manger.exist(cfg.currentProjectName.value):
+            self.show_info_bar(self.tr("Warning"), self.tr("project's not exist"), 2)
+            return
+        dialog = RepackZipMessageBox(self.parent())
+        if dialog.exec_():
+            if dialog.is_add_tools_checked():
+                if not dialog.get_device_code():
+                    self.show_info_bar(self.tr("Warning"), self.tr("device code's empty"), 3)
+                    return
+                if PackHybridRom(dialog.get_device_code()):
+                    return
+            input_dir = project_manger.current_work_output_path()
+            output_zip = f"{cfg.workingFolder.value}/{cfg.currentProjectName.value}.zip"
+            self.pack_zip_task = GenericTaskWorker(utils.pack_zip, input_dir, output_zip)
+            self.start_job(self.pack_zip_task)
+
+    def _build_tools_section(self, parent_widget):
+        """高级工具箱：纯扁平化工具栏，取消卡片框"""
+        container = QWidget(parent_widget)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        # 标题放外面
+        layout.addWidget(QLabel(self.tr("Others")))
+
+        # 工具按钮行
+        tools_layout = QHBoxLayout()
+
+        self.super_btn = PushButton(self.tr("Pack Super"), container, FIF.ALBUM)
+        self.super_btn.clicked.connect(self.pack_super)
+        self.format_conv_btn = PushButton(self.tr("Format convertion"), container, FIF.EMBED)
+        self.format_conv_btn.clicked.connect(self.convert_image)
+
+        for btn in [self.super_btn, self.format_conv_btn]:
+            btn.setMinimumWidth(105)
+            tools_layout.addWidget(btn)
+
+        tools_layout.addStretch(1)
+        layout.addLayout(tools_layout)
+
+        self.scroll_layout.addWidget(container)
+
+    def refresh_repack(self):
+        if not self._applying_partition_format:
+            self._schedule_partition_list_load()
+
+    def logo_pack(self, origin_logo=None) -> int:
+        work = project_manger.current_work_path()
+        if not origin_logo:
+            origin_logo = utils.findfile('logo.img', work)
+        logo = f"{work}/logo-new.img"
+        if not os.path.exists(dir_ := f"{work}/logo") or not os.path.exists(origin_logo):
+            print(self.tr("origin logo missing"))
+            return 1
+        utils.LogoDumper(origin_logo, logo, dir_).repack()
+        os.remove(origin_logo)
+        os.rename(logo, origin_logo)
+        rmtree(dir_)
+        return 1
+
+    def datbr(self, work: str, name: str, brl: str | int, dat_ver: int = 4):
+        """
+
+        :param work: working dir
+        :param name: the name of the partitition
+        :param brl: if its a int , will convert the file to br, if "dat" just convert to dat
+        :param dat_ver: dat version
+        :return:None
+        """
+        print(f"[datbr] Packing {name}")
+        if not os.path.exists(f"{work}/{name}.img"):
+            print(f"{work}/{name}.img is not exist")
+            return
+        else:
+            utils.img2sdat(f"{work}/{name}.img", work, dat_ver, name)
+        if os.access(f"{work}/{name}.new.dat", os.F_OK):
+            try:
+                os.remove(f"{work}/{name}.img")
+            except Exception:
+                logging.exception('Bugs')
+                os.remove(f"{work}/{name}.img")
+        if brl == "dat":
+            print(f"Packing {name} to dat done")
+        else:
+            print(f"Packing {name} to br")
+            call(['brotli', '-q', str(brl), '-j', '-w', '24', f"{work}/{name}.new.dat", '-o',
+                  f"{work}/{name}.new.dat.br"])
+            if os.access(f"{work}/{name}.new.dat", os.F_OK):
+                try:
+                    os.remove(f"{work}/{name}.new.dat")
+                except Exception:
+                    logging.exception('Bugs')
+            print(f"Packing {name} to br done")
+
+    def rdi(self, work: str, part_name: str) -> bool:
+        if not os.listdir(f"{work}/config"):
+            rmtree(f"{work}/config")
+            return False
+        if os.access(f"{work}/{part_name}.img", os.F_OK):
+            print(self.tr("Repacked %s Done") % part_name)
+            try:
+                rmtree(work + part_name)
+                for i_ in ["%s_size.txt", "%s_file_contexts", '%s_fs_config', '%s_fs_options']:
+                    path_ = os.path.join(work, "config", i_ % part_name)
+                    if os.access(path_, os.F_OK):
+                        os.remove(path_)
+            except Exception as e:
+                logging.exception(e)
+            print(self.tr("Repacked %s Done") % part_name)
+        else:
+            self.show_info_bar(self.tr("Error"), f"Failed to repack {part_name}")
+        return True
+
+    def mkerofs(self, name: str, format_, work, work_output, level, old_kernel: bool = False, UTC: int = None):
+        if not UTC:
+            UTC = int(time.time())
+        try:
+            repaired = repair_erofs_symlinks(os.path.join(work, name))
+        except (OSError, ValueError) as error:
+            print(f'[erofs] Cannot repack {name}: {error}', flush=True)
+            return 1
+        if repaired:
+            print(f'[erofs] Restored {repaired} Windows symlink markers in {name}', flush=True)
+        print("[erofs] Repacking %s - %s" % (name, f'{format_},{level}'))
+        extra_ = f'{format_},{level}' if format_ != 'lz4' else format_
+        other_ = ['-E', 'legacy-compress'] if old_kernel else []
+        cmd = ['mkfs.erofs', *other_, f'-z{extra_}', '-T', f'{UTC}', f'--mount-point=/{name}',
+               f'--product-out={work}',
+               f'--fs-config-file={work}/config/{name}_fs_config',
+               f'--file-contexts={work}/config/{name}_file_contexts',
+               f'{work_output}/{name}.img', f'{work}/{name}/']
+        return call(cmd, out=True)
+
+    def make_ext4fs(self, name: str, work: str, work_output, sparse: bool = False, size: int = 0, UTC: int = None,
+                    has_contexts: bool = True):
+        if not has_contexts:
+            print("make_ext4fs", self.tr('Warning:file_context not found!!!'))
+        print(f"packing {name} [ext]")
+        if not UTC:
+            UTC = int(time.time())
+        if not size:
+            size = utils.GetFolderSize(os.path.join(work, name), 1, 3, f"{work}/dynamic_partitions_op_list").rsize_v
+        print(f"{name}:[{size}]")
+        context_cmd = ['-S', f'{work}/config/{name}_file_contexts'] if has_contexts else []
+        command = ['make_ext4fs', '-J', '-T', f'{UTC}', '-s' if sparse else '', *context_cmd, '-l',
+                   f'{size}',
+                   '-C', f'{work}/config/{name}_fs_config', '-L', name, '-a', f'/{name}', f"{work_output}/{name}.img",
+                   work + name]
+        return call(command)
+
+    def make_f2fs(self, name: str, work: str, work_output: str, UTC: int | None = None, readonly: bool = False,
+                  compress: bool = False):
+        print("[f2fs] repacking %s" % name)
+        size = utils.GetFolderSize(work + name, 1, 1).rsize_v
+        part_uuid = str(uuid.uuid4())
+        print(f"{name} - {size} - {part_uuid}")
+
+        def align_to_4k(size):
+            # Align the size upwards to multiples of 4096 bytes.
+            return (size + 4095) // 4096 * 4096
+
+        # Set to 64MB to reserve space for F2FS Metadata
+        size_f2fs = (64 * 1024 * 1024) + size
+        # Apply a safety margin
+        size_f2fs = int(size_f2fs * 1.15)
+        # Align size to 4096-byte multiples.
+        # Android dynamic partitions require sector alignment.
+        # Mismatched block sizes will cause 'lpmake' read errors or mount failures.
+        size_f2fs = align_to_4k(size_f2fs)
+
+        if not UTC:
+            UTC = int(time.time())
+        with open(f"{work + name}.img", 'wb') as f:
+            f.truncate(size_f2fs)
+        # /usr/bin/make_f2fs -d 0 -l odm -O extra_attr,compression,ro -U d6112980-bd3b-4b9e-bf4c-fba453cfdb42 -T 1230768000 ./Projects/Project_name/Build/odm.img -f
+        #
+        if call(['mkfs.f2fs', '-d', '0', '-l', name, '-O',
+                 "extra_attr,compression,ro" if readonly else 'extra_attr,inode_checksum,sb_checksum,compression', "-U",
+                 part_uuid, '-T', str(UTC), f"{work_output}/{name}.img", '-f']):
+            return 1
+        # The efficiency of verifying and adding file contexts has been improved.
+        # Let's confirm that the basic context for the partition is present.
+        line_to_ensure = f'/{name}/{name} u:object_r:system_file:s0\n'
+        file_contexts_path = f'{work}/config/{name}_file_contexts'
+
+        found = False
+        with suppress(FileNotFoundError):
+            with open(file_contexts_path, 'r', encoding='utf-8') as f_read:
+                for line in f_read:
+                    if line.strip() == line_to_ensure.strip():
+                        found = True
+                        break
+
+        if not found:
+            with open(file_contexts_path, 'a', encoding='utf-8') as f_append:
+                f_append.write(line_to_ensure)
+        return call(['sload.f2fs', '-d', '0', '-c' if compress else '', '-r' if readonly else '', '-C',
+                     f'{work}/config/{name}_fs_config', '-f', work + name, '-p', f'{work_output}/{name}.img', '-s',
+                     f'{work}/config/{name}_file_contexts', '-t', f'/{name}', '-T', str(UTC),
+                     f'{work_output}/{name}.img'])
+
+    def mke2fs(self, name: str, work: str, sparse: bool, work_output: str, size: int = 0, UTC: int|None = None):
+        print("[ext] repacking %s" % name)
+        size = utils.GetFolderSize(os.path.join(work, name), 4096, 3,
+                                   f"{work}/dynamic_partitions_op_list").rsize_v if not size else size / 4096
+        print(f"{name}:[{size}]")
+        utc_time = UTC
+        if not utc_time:
+            utc_time = int(time.time())
+        if call(
+                ['mke2fs', '-O',
+                 '^has_journal,^metadata_csum,extent,huge_file,^flex_bg,^64bit,uninit_bg,dir_nlink,extra_isize', '-L',
+                 name,
+                 '-I', '256', '-M', f'/{name}', '-m', '0', '-t', 'ext4', '-b', '4096', f'{work_output}/{name}_new.img',
+                 f'{int(size)}']) != 0:
+            os.remove(f'{work_output}/{name}_new.img')
+            print(f"packing {name} failed [mke2fs]")
+            return 1
+        ret = call(
+            ['e2fsdroid', '-e', '-T', f'{utc_time}', '-S', f'{work}/config/{name}_file_contexts', '-C',
+             f'{work}/config/{name}_fs_config', '-a', f'/{name}', '-f', f'{work}/{name}',
+             f'{work_output}/{name}_new.img'])
+        if ret != 0:
+            os.remove(f'{work}/{name}_new.img')
+            print(f"packing {name} failed [e2fsdroid]")
+            return 1
+        if sparse:
+            call(['img2simg', f'{work_output}/{name}_new.img', f'{work_output}/{name}.img'])
+            try:
+                os.remove(f"{work_output}/{name}_new.img")
+            except (Exception, BaseException):
+                logging.exception('Bugs')
+        else:
+            if os.path.isfile(f"{work_output}/{name}.img"):
+                try:
+                    os.remove(f"{work_output}/{name}.img")
+                except (Exception, BaseException):
+                    logging.exception('Bugs')
+            os.rename(f"{work_output}/{name}_new.img", f"{work_output}/{name}.img")
+        return 0
+
+    def repack_boot(self, name: str = 'boot', source: str | None = None, boot: str | None = None) -> int:
+        work = project_manger.current_work_path()
+        flag = ''
+        if boot is None:
+            boot = utils.findfile(f"{name}.img", work)
+            if not boot:
+                print(self.tr("Origin boot is lost.Cannot repack boot.img."))
+                return 1
+        if source is None:
+            source = os.path.join(work, name)
+        if not os.path.exists(source):
+            print(f"Cannot Find {name}...")
+            return 1
+        if os.path.isfile(f'{source}/second_order'):
+            print(self.tr("Repack Rk resource..."))
+            rsceutil_repack(f"{source}/second_dump", f"{source}/second", f"{source}/second_order")
+            print(self.tr("Repack Rk resource successfully..."))
+        if os.path.isdir(f"{source}/ramdisk"):
+            if cfg.cpioImpl.value == 'Python':
+                cpio_repack(f"{source}/ramdisk", f"{source}/ramdisk.txt", f"{source}/ramdisk-new.cpio")
+            else:
+                cpio = os.path.join(cfg.tool_bin, 'cpio' if os.name != 'nt' else "cpio.exe")
+                cpio = os.path.realpath(cpio)
+                if os.name == 'nt':
+                    cpio = cpio.replace("\\", '/')
+
+                os.chdir(f"{source}/ramdisk")
+                call(exe=["busybox", "ash", "-c", f"find | sed 1d | {cpio} -H newc -R 0:0 -o -F ../ramdisk-new.cpio"])
+            with open(f"{source}/comp", "r", encoding='utf-8') as compf:
+                comp = compf.read()
+            print(f"Compressing:{comp}")
+            os.chdir(source)
+            if comp != "unknown":
+                if call(['magiskboot', f'compress={comp}', 'ramdisk-new.cpio']) != 0:
+                    print("Failed to pack Ramdisk...")
+                    os.remove("ramdisk-new.cpio")
+                else:
+                    try:
+                        os.remove("ramdisk.cpio")
+                    except (Exception, BaseException):
+                        logging.exception('Bugs')
+                    if comp == 'gzip':
+                        comp = 'gz'
+                    os.rename(f"ramdisk-new.cpio.{comp.split('_')[0]}", "ramdisk.cpio")
+            else:
+                if os.path.exists('ramdisk.cpio'):
+                    os.remove("ramdisk.cpio")
+                if os.path.exists('ramdisk-new.cpio'):
+                    os.rename("ramdisk-new.cpio", "ramdisk.cpio")
+                else:
+                    events.show_info_bar.emit(self.tr("Error"), self.tr("Failed to repack ramdisk."), 1, 3000)
+                    return 1
+            print(f"Ramdisk Compression:{comp}")
+            if comp == "unknown":
+                flag = "-n"
+            print(self.tr("Successfully packed Ramdisk.."))
+        if call(['magiskboot', 'repack', flag, boot]) != 0:
+            events.show_info_bar.emit(self.tr("Error"), self.tr("Failed to Pack boot..."), 1, 3000)
+            os.chdir(cfg.workingFolder.value)
+        else:
+            os.remove(boot)
+            os.rename(f"{source}/new-boot.img", project_manger.current_work_output_path() + f"/{name}.img")
+            os.chdir(cfg.workingFolder.value)
+            try:
+                rmtree(source)
+            except (Exception, BaseException):
+                print(f"Failed to remove {name}")
+            print(self.tr("Successfully packed Boot..."))
+        return 0
+
+    def show_info_bar(self, title: str, content: str, bar_type: int = 3, duration=5000):
+        """bar_type: 1=error 2=warning 3=SUCCESS 4=INFO"""
+        icon_map = {
+            1: InfoBarIcon.ERROR,
+            2: InfoBarIcon.WARNING,
+            3: InfoBarIcon.SUCCESS,
+            4: InfoBarIcon.INFORMATION
+        }
+        InfoBar.new(icon=icon_map.get(bar_type, InfoBarIcon.INFORMATION),
+                    title=title,
+                    content=content,
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=duration,
+                    parent=self.parent())
+
+    def packrom(self, chosen_parts,
+                pack_format, patch_vbmeta, fs_conver, origin_fs, modify_fs, remove_source_files,
+                erofs_compress_format, scale_erofs, erofs_old_kernel, UTC,
+                f2fs_read_only, f2fs_compresion, ext4_packer, scale, ext4_origin_size) -> bool | None:
+        if not project_manger.exist():
+            self.show_info_bar(self.tr('Error'), self.tr("project's not exist"), 1)
+            return False
+        parts_dict = utils.JsonEdit(
+            os.path.join(work := project_manger.current_work_path(), "config/parts_info")
+        ).read()
+        for i in chosen_parts:
+            dname = os.path.basename(i)
+            if dname not in parts_dict.keys():
+                parts_dict[dname] = 'unknown'
+            if patch_vbmeta:
+                for j in "vbmeta.img", "vbmeta_system.img", "vbmeta_vendor.img":
+                    file = utils.findfile(j, work)
+                    if gettype(file) == 'vbmeta':
+                        print("Patching %s" % file)
+                        utils.Vbpatch(file).disavb()
+            if os.access(os.path.join(f"{work}/config", f"{dname}_fs_config"), os.F_OK):
+                if os.name == 'nt':
+                    try:
+                        if folder := utils.findfolder(work, "com.google.android.apps.nbu."):
+                            call(['mv', folder,
+                                  folder.replace('com.google.android.apps.nbu.', 'com.google.android.apps.nbu')])
+                    except Exception:
+                        logging.exception('Bugs')
+                fspatch.main(os.path.join(work, dname), os.path.join(f"{work}/config", f"{dname}_fs_config"))
+                utils.remove_duplicate(f"{work}/config/{dname}_fs_config")
+                contexts_file = f"{work}/config/{dname}_file_contexts"
+                if os.path.exists(contexts_file):
+                    if cfg.selinuxPatch.value:
+                        contextpatch.main(os.path.join(work, dname), contexts_file, context_rule_file)
+                        new_rules = contextpatch.scan_context(contexts_file)
+                        rules = utils.JsonEdit(context_rule_file)
+                        rules.write(new_rules | rules.read())
+
+                    utils.remove_duplicate(contexts_file)
+                if fs_conver:
+                    if parts_dict[dname] == origin_fs:
+                        parts_dict[dname] = modify_fs
+                if parts_dict[dname] == 'erofs':
+                    if self.mkerofs(dname, str(erofs_compress_format), work=work,
+                                    work_output=project_manger.current_work_output_path(), level=int(scale_erofs),
+                                    old_kernel=erofs_old_kernel, UTC=UTC) != 0:
+                        print("Failed to repack {} [erofs]".format(dname))
+                    else:
+                        if remove_source_files:
+                            self.rdi(work, dname)
+                        print("Packed successfully:{}".format(dname))
+                        if pack_format in ["dat", "br", "sparse"]:
+                            utils.img2simg(project_manger.current_work_output_path() + f"{dname}.img")
+                            if pack_format == 'dat':
+                                self.datbr(project_manger.current_work_output_path(), dname, "dat",
+                                           int(parts_dict.get('dat_ver', 4)))
+                            elif pack_format == 'br':
+                                self.datbr(project_manger.current_work_output_path(), dname, scale,
+                                           int(parts_dict.get('dat_ver', 4)))
+                            else:
+                                print("Packed successfully: {}!".format(dname))
+                elif parts_dict[dname] == 'f2fs':
+                    if self.make_f2fs(dname, work=work, work_output=project_manger.current_work_output_path(),
+                                      UTC=UTC, readonly=f2fs_read_only,
+                                      compress=f2fs_compresion) != 0:
+                        print("Failed to pack %s!" % dname)
+                    else:
+                        if remove_source_files:
+                            self.rdi(work, dname)
+                        print("Packed successfully: {}!".format(dname))
+                        if pack_format in ["dat", "br", "sparse"]:
+                            utils.img2simg(os.path.join(project_manger.current_work_output_path(), f"{dname}.img"))
+                            if pack_format == 'dat':
+                                self.datbr(project_manger.current_work_output_path(), dname, "dat",
+                                           int(parts_dict.get('dat_ver', 4)))
+                            elif pack_format == 'br':
+                                self.datbr(project_manger.current_work_output_path(), dname, scale,
+                                           int(parts_dict.get('dat_ver', 4)))
+                            else:
+                                print(self.tr("Packed successfully: {}!").format(dname))
+
+                else:
+                    ext4_size_value = 0
+                    if ext4_origin_size:
+                        list_file = f"{work}/dynamic_partitions_op_list"
+                        if os.path.exists(list_file):
+                            with open(list_file, 'r', encoding='utf-8') as t:
+                                for _i_ in t.readlines():
+                                    _i = _i_.strip().split()
+                                    if len(_i) < 3:
+                                        continue
+                                    if _i[0] != 'resize':
+                                        continue
+                                    if _i[1] in [dname, f'{dname}_a', f'{dname}_b']:
+                                        ext4_size_value = max(ext4_size_value, int(_i[2]))
+                        elif os.path.exists(f"{work}/config/{dname}_size.txt"):
+                            with open(f"{work}/config/{dname}_size.txt", encoding='utf-8') as f:
+                                try:
+                                    ext4_size_value = int(f.read().strip())
+                                except ValueError:
+                                    ext4_size_value = 0
+                    if ext4_packer == "make_ext4fs":
+                        exit_code = self.make_ext4fs(name=dname, work=work,
+                                                     work_output=project_manger.current_work_output_path(),
+                                                     sparse=pack_format in ["dat", "br", "sparse"],
+                                                     size=ext4_size_value,
+                                                     UTC=UTC, has_contexts=os.path.exists(contexts_file))
+
+                    else:
+                        exit_code = self.mke2fs(
+                            name=dname, work=work,
+                            work_output=project_manger.current_work_output_path(),
+                            sparse=pack_format in [
+                                "dat",
+                                "br",
+                                "sparse"],
+                            size=ext4_size_value,
+                            UTC=UTC)
+                    if exit_code:
+                        print(self.tr("Failed to pack %s!") % dname)
+                        continue
+
+                    if remove_source_files:
+                        self.rdi(work, dname)
+                    if pack_format == "dat":
+                        self.datbr(project_manger.current_work_output_path(), dname, "dat",
+                                   int(parts_dict.get('dat_ver', '4')))
+                    elif pack_format == "br":
+                        self.datbr(project_manger.current_work_output_path(), dname, scale,
+                                   int(parts_dict.get('dat_ver', '4')))
+                    else:
+                        print(self.tr("Packed {}").format(dname))
+            elif parts_dict[i] in ['boot', 'vendor_boot']:
+                self.repack_boot(i)
+            elif parts_dict[i] == 'dtbo':
+                self.pack_dtbo()
+            elif parts_dict[i] == 'splash':
+                splash_repack(os.path.join(work, dname), os.path.join(work, f"{dname}.img"))
+            elif parts_dict[i] == 'logo':
+                self.logo_pack()
+            elif parts_dict[i] == 'guoke_logo':
+                utils.GuoKeLogo().pack(os.path.join(work, dname), os.path.join(work, f"{dname}.img"))
+            else:
+                if os.path.exists(os.path.join(work, i)):
+                    events.show_info_bar.emit(self.tr("Warning"), f"Unsupported {i}:{parts_dict[i]}", 2, 3000)
+                logging.warning(f"{i}:{parts_dict[i]} Not Supported.")
+
+    def start_job(self, worker: GenericTaskWorker):
+        sys.stderr_old = sys.stderr
+        sys.stdout_old = sys.stdout
+        self.stdout_redirector = StreamToSignal(sys.stdout)
+        self.stderr_redirector = StreamToSignal(sys.stderr)
+        self.stdout_redirector.text_written.connect(lambda text: self.scroll_log_content.append_log("INFO", text))
+        self.stderr_redirector.text_written.connect(lambda text: self.scroll_log_content.append_log("ERROR", text))
+        sys.stdout = self.stdout_redirector
+        sys.stderr = self.stderr_redirector
+        # # then set sys.stdout and back
+        self.ring.show()
+        self.ring.start()
+        worker.task_finished.connect(self.job_is_done)
+        worker.start()
+        self.execute_btn.setEnabled(False)
+
+    def exec_opera(self):
+        # then set sys.stdout
+        if self.unpack_rb.isChecked():
+            unpack_list = []
+            for row_idx in range(self.partition_table.rowCount()):
+                item = self.partition_table.item(row_idx, 0)
+                if item.checkState() == Qt.CheckState.Checked:
+                    unpack_list.append(item.text())
+            self.my_task_worker = GenericTaskWorker(self.unpack, unpack_list, self.format_widget.currentItem().text())
+        else:
+            pack_list = []
+            for row_idx in range(self.partition_table.rowCount()):
+                item = self.partition_table.item(row_idx, 0)
+                if item.checkState() == Qt.CheckState.Checked:
+                    pack_list.append(item.text())
+            dialog = PackSettingsDialog(self)
+            # Display modally. If the user clicks "打包" (Yes/Accept), exec() returns True/1
+            if dialog.exec():
+                self.my_task_worker = GenericTaskWorker(self.packrom,
+                                                        pack_list,
+                                                        dialog.format_combo.currentText(),
+                                                        dialog.sw_vbmeta.isChecked(),
+                                                        dialog.sw_convert.isChecked(),
+                                                        dialog.src_fs_combo.currentText(),
+                                                        dialog.dest_fs_combo.currentText(),
+                                                        dialog.sw_delete.isChecked(),
+                                                        dialog.compress_algo_combo.currentText(),
+                                                        dialog.erofs_slider.value(),
+                                                        dialog.support_old_kernel_switch.isChecked(),
+                                                        dialog.utc_input.text(),
+                                                        dialog.f2fs_readonly_switch.isChecked(),
+                                                        dialog.f2fs_compress_switch.isChecked(),
+                                                        dialog.pack_method_combo.currentText(),
+                                                        dialog.brotli_slider.value(),
+                                                        dialog.size_handle_combo.currentText() == self.tr(
+                                                            "Origin Size"),
+                                                        )
+            else:
+                return
+        self.start_job(self.my_task_worker)
+
+    def job_is_done(self):
+        self.ring.stop()
+        self.ring.hide()
+        sys.stderr = sys.stderr_old
+        sys.stdout = sys.stdout_old
+        self.execute_btn.setEnabled(True)
+
+    def refresh_unpack(self):
+        if not self._applying_partition_format:
+            self._schedule_partition_list_load()
+
+    def filter_tabview(self, query: str):
+        search_query = query.strip().lower()
+        for row_idx in range(self.partition_table.rowCount()):
+            item = self.partition_table.item(row_idx, 0)
+            if item is not None:
+                cell_text = item.text().strip().lower()
+                self.partition_table.setRowHidden(row_idx, not (search_query in cell_text or not search_query))
+
+    def unpack(self, chose: list | dict, form: str = '') -> bool:
+        if os.name == 'nt':
+            if windll.shell32.IsUserAnAdmin():
+                try:
+                    ensure_dir_case_sensitive(project_manger.current_work_path())
+                except (Exception, BaseException):
+                    logging.exception('Bugs')
+        if not project_manger.exist() or not os.path.exists(project_manger.current_work_path()):
+            events.show_info_bar.emit(self.tr("Warning"), self.tr("Project's not exist"), 3, 3000)
+            return False
+
+        json_ = utils.JsonEdit(os.path.join(work := project_manger.current_work_path(), "config/parts_info"))
+        # add a file lock here.
+        parts = json_.read()
+        if not chose:
+            return False
+        if form == 'payload':
+            time_start = time.time()
+            with open(f"{work}/payload.bin", "rb") as f:
+                extract_partitions_from_payload(
+                    f,
+                    (
+                        chose
+                    ),
+                    work,
+                    os.cpu_count() or 2,
+                )
+            tooks = time.time() - time_start
+            print("Done! tooks: %.2f" % tooks)
+            return True
+        elif form == 'super':
+            print("Unpacking Super...")
+            file_type = gettype(f"{work}/super.img")
+            if file_type == "sparse":
+                print(f"Unpacking super.img [{file_type}]")
+                try:
+                    utils.simg2img(f"{work}/super.img")
+                except (Exception, BaseException):
+                    events.show_info_bar.emit(self.tr("Error"), self.tr("Cannot simg2img super.img"), 1, 3000)
+            if gettype(f"{work}/super.img") == 'super':
+                # should get info here.
+                parts["super_info"] = lpunpack.get_info(os.path.join(work, "super.img"))
+                lpunpack.unpack(os.path.join(work, "super.img"), work, chose)
+                for file_name in os.listdir(work):
+                    if file_name.endswith('_a.img') and not os.path.exists(work + file_name.replace('_a', '')):
+                        os.rename(work + file_name, work + file_name.replace('_a', ''))
+                    if file_name.endswith('_b.img'):
+                        if not os.path.getsize(work + file_name):
+                            os.remove(work + file_name)
+                json_.write(parts)
+                parts.clear()
+            return True
+        elif form == 'update.app':
+            splituapp.extract(f"{work}/UPDATE.APP", work, chose)
+            return True
+        for i in chose:
+            if os.access(f"{work}/{i}.zst", os.F_OK):
+                print(f"Decompressing {i}.zst")
+                utils.call(['zstd', '--rm', '-d', f"{work}/{i}.zst"])
+                events.refresh_list.emit()
+                return True
+            if os.access(f"{work}/{i}.new.dat.xz", os.F_OK):
+                print(f"Decompressing {i}.new.dat.xz")
+                utils.Unxz(f"{work}/{i}.new.dat.xz")
+            if os.access(f"{work}/{i}.new.dat.br", os.F_OK):
+                print(f"Decompressing  {i}.new.dat.br")
+                utils.call(['brotli', '-dj', f"{work}/{i}.new.dat.br"])
+            if os.access(f"{work}/{i}.new.dat.1", os.F_OK):
+                with open(f"{work}/{i}.new.dat", 'ab') as ofd:
+                    for n in range(100):
+                        if os.access(f"{work}/{i}.new.dat.{n}", os.F_OK):
+                            print("Merging %s to %s" % (f"{i}.new.dat.{n}", f"{i}.new.dat"))
+                            with open(f"{work}/{i}.new.dat.{n}", 'rb') as fd:
+                                ofd.write(fd.read())
+                            os.remove(f"{work}/{i}.new.dat.{n}")
+            if os.access(f"{work}/{i}.new.dat", os.F_OK):
+                print(f"Unpacking {work}/{i}.new.dat")
+                if os.path.getsize(f"{work}/{i}.new.dat") != 0:
+                    transferfile = f"{work}/{i}.transfer.list"
+                    if os.access(transferfile, os.F_OK):
+                        parts['dat_ver'] = utils.Sdat2img(transferfile, f"{work}/{i}.new.dat",
+                                                          f"{work}/{i}.img").version
+                        if os.access(f"{work}/{i}.img", os.F_OK):
+                            os.remove(f"{work}/{i}.new.dat")
+                            os.remove(transferfile)
+                            try:
+                                os.remove(f'{work}/{i}.patch.dat')
+                            except (Exception, BaseException):
+                                logging.exception('Bugs')
+                        else:
+                            print("File May Not Extracted.")
+                    else:
+                        events.show_info_bar.emit(self.tr("Error"), self.tr("transferfile of {} missing").format(i), 1,
+                                                  3000)
+                events.refresh_list.emit()
+            if os.access(f"{work}/{i}.img", os.F_OK):
+                try:
+                    if i in parts:
+                        parts.pop(i)
+                except KeyError:
+                    logging.exception('Key')
+                if gettype(f"{work}/{i}.img") != 'sparse':
+                    parts[i] = gettype(f"{work}/{i}.img")
+                if gettype(f"{work}/{i}.img") == 'dtbo':
+                    un_dtbo(i)
+                    events.refresh_list.emit()
+                    continue
+                if gettype(f"{work}/{i}.img") in ['boot', 'vendor_boot']:
+                    unpack_boot(i, boot=f"{work}/{i}.img")
+                    events.refresh_list.emit()
+                    continue
+                if i == 'logo':
+                    try:
+                        utils.LogoDumper(f"{work}/{i}.img", f'{work}/{i}').check_img(f"{work}/{i}.img")
+                    except AssertionError:
+                        logging.exception('Bugs')
+                    else:
+                        logo_dump(f"{work}/{i}.img", output_name=i)
+                if gettype(f"{work}/{i}.img") == 'vbmeta':
+                    print(f"Patching AVB:{i}")
+                    utils.Vbpatch(f"{work}/{i}.img").disavb()
+                file_type = gettype(f"{work}/{i}.img")
+                if file_type == "sparse":
+                    print(f"Unpacking {i}.img[{file_type}]")
+                    try:
+                        utils.simg2img(f"{work}/{i}.img")
+                    except (Exception, BaseException) as e:
+                        logging.exception(e)
+                        events.show_info_bar.emit(self.tr("Warning"), str(e), 1, 5000)
+                        continue
+                if i not in parts.keys():
+                    parts[i] = gettype(f"{work}/{i}.img")
+                print(f"Unpacking {i}.img[{file_type}]")
+                if gettype(f"{work}/{i}.img") == 'super':
+                    parts["super_info"] = lpunpack.get_info(f"{work}/{i}.img")
+                    lpunpack.unpack(f"{work}/{i}.img", work)
+                    for file_name in os.listdir(work):
+                        file_path = os.path.join(work, file_name)
+                        if file_name.endswith('_a.img'):
+                            if os.path.exists(file_path) and os.path.exists(work + file_name.replace('_a', '')):
+                                if pathlib.Path(file_path).samefile(work + file_name.replace('_a', '')):
+                                    os.remove(file_path)
+                                else:
+                                    os.remove(work + file_name.replace('_a', ''))
+                                    os.rename(file_path, work + file_name.replace('_a', ''))
+                            else:
+                                os.rename(file_path, work + file_name.replace('_a', ''))
+                        if file_name.endswith('_b.img'):
+                            if not os.path.getsize(file_path):
+                                os.remove(file_path)
+                    json_.write(parts)
+                    parts.clear()
+                elif (file_type := gettype(f"{work}/{i}.img")) == "ext":
+                    with open(f"{work}/{i}.img", 'rb+') as e:
+                        mount = ext4.Volume(e).get_mount_point
+                        if mount[:1] == '/':
+                            mount = mount[1:]
+                        if '/' in mount:
+                            mount = mount.split('/')
+                            mount = mount[len(mount) - 1]
+                        if mount != i and mount and i != 'mi_ext':
+                            parts[mount] = 'ext'
+                    # libutils.ext4_extractor(f'{work}/config', f"/{mount}", project_manger.current_work_path() + i + ".img", f'{work}/{i}', 4096, 'e', False, i)
+                    imgextractor.Extractor().main(project_manger.current_work_path() + f"{i}.img", f'{work}/{i}', work)
+                    if os.path.exists(f'{work}/{i}'):
+                        try:
+                            os.remove(f"{work}/{i}.img")
+                        except Exception as e:
+                            events.show_info_bar.emit(self.tr('Warning'), f"Cannot remove {i}.img", 1, 3000)
+
+                elif file_type == 'romfs':
+                    fs = RomfsParse(project_manger.current_work_path() + f"{i}.img")
+                    fs.extract(work)
+                elif file_type == 'fne':
+                    continue
+                elif file_type in ['rkfw', 'rkaf']:
+                    utils.call(['afptool', 'unpack', f"{project_manger.current_work_path()}/{i}.img", work])
+                elif file_type == 'guoke_logo':
+                    utils.GuoKeLogo().unpack(os.path.join(project_manger.current_work_path(), f'{i}.img'),
+                                             f'{work}/{i}')
+                elif file_type == 'splash':
+                    if not os.path.exists(splash_out_dir := os.path.join(work, i)):
+                        os.makedirs(splash_out_dir, True)
+                    process_splashimg(os.path.join(project_manger.current_work_path(), f'{i}.img'),
+                                      f"{work}/{i}/splash.png")
+                elif file_type == 'gpt':
+                    reader = GPTReader(os.path.join(project_manger.current_work_path(), f'{i}.img'), sector_size=512)
+                    for partition in reader.partition_table.valid_entries():
+                        print('guid/type={} first-block={} size={} name={}'.format(
+                            partition.partition_type, partition.first_block, partition.length, partition.name))
+                        if True:
+                            file_base_name = partition.name if partition.name else str(partition.partition_id)
+
+                            out_file = os.path.join(work, f'{file_base_name}.img')
+                            print(f'Writing partition to file {out_file}')
+
+                            with open(out_file, 'wb+') as fout:
+                                for block in reader.block_reader.blocks_in_range(partition.first_block,
+                                                                                 partition.length):
+                                    fout.write(block)
+
+                elif file_type == "erofs":
+                    if utils.call(
+                            exe=['extract.erofs', '-i', os.path.join(project_manger.current_work_path(), f'{i}.img'),
+                                 '-o',
+                                 work,
+                                 '-x'],
+                            out=True) != 0:
+                        events.show_info_bar.emit(self.tr('Error'), f"Failed to unpack {i}.img", 1, 3000)
+                        continue
+                    try:
+                        repaired = repair_erofs_symlinks(os.path.join(work, i))
+                    except (OSError, ValueError) as error:
+                        print(f'[erofs] Unpacked {i} has invalid symlinks: {error}', flush=True)
+                        continue
+                    if repaired:
+                        print(f'[erofs] Restored {repaired} Windows symlink markers in unpacked {i}', flush=True)
+                    if os.path.exists(f'{work}/{i}'):
+                        try:
+                            os.remove(f"{work}/{i}.img")
+                        except (Exception, BaseException):
+                            self.show_info_bar(self.tr("Warning"), f"Cannot remove {i}.img", 1)
+                elif file_type == 'f2fs':
+                    if utils.call(
+                            exe=['imgkit', 'unpack', "-i", os.path.join(project_manger.current_work_path(), f'{i}.img'),
+                                 "-o", work],
+                            out=True) != 0:
+                        events.show_info_bar.emit(self.tr('Error'), f"Failed to unpack {i}.img", 1, 3000)
+                        continue
+                    if os.path.exists(f'{work}/{i}'):
+                        try:
+                            os.remove(f"{work}/{i}.img")
+                        except (Exception, BaseException):
+                            self.show_info_bar(self.tr("Warning"), f"Cannot remove {i}.img", 1)
+                elif file_type == 'amlogic':
+                    aml_main(os.path.join(project_manger.current_work_path(), f'{i}.img'), work)
+                elif file_type == 'unknown' or utils.is_empty_img(f"{work}/{i}.img"):
+                    events.show_info_bar.emit(self.tr("Warning"),
+                                              self.tr("Unsupported file {}.img [{}]").format(i, file_type), 2, 5000)
+                events.refresh_list.emit()
+        if not os.path.exists(f"{work}/config"):
+            os.makedirs(f"{work}/config")
+        json_.write(parts)
+        parts.clear()
+        events.show_info_bar.emit(self.tr("Success"), self.tr("Unpacking Done"), 3, 3000)
+        return True
+
+    def _load_mock_partitions_table(self, mock_data):
+        was_blocked = self.partition_table.blockSignals(True)
+        self.partition_table.setUpdatesEnabled(False)
+        try:
+            self.partition_table.setRowCount(len(mock_data))
+            for row_idx, (name, size, fs, img_type, attrs) in enumerate(mock_data):
+                name_item = QTableWidgetItem(name)
+                name_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                name_item.setCheckState(Qt.Unchecked)
+                self.partition_table.setItem(row_idx, 0, name_item)
+                self.partition_table.setItem(row_idx, 1, QTableWidgetItem(size))
+                self.partition_table.setItem(row_idx, 2, QTableWidgetItem(fs))
+
+                badge = QLabel(img_type)
+                badge.setAlignment(Qt.AlignCenter)
+                badge.setStyleSheet(
+                    f"color: {'#a78bfa' if img_type == 'Build' else '#f59e0b'}; border-radius: 6px; "
+                    "font-weight: bold; font-size: 11px; margin: 3px;"
+                )
+                self.partition_table.setCellWidget(row_idx, 3, badge)
+                self.partition_table.setItem(row_idx, 4, QTableWidgetItem(attrs))
+        finally:
+            self.partition_table.setUpdatesEnabled(True)
+            self.partition_table.blockSignals(was_blocked)
+
+        was_blocked = self.select_all_cb.blockSignals(True)
+        try:
+            self.select_all_cb.setChecked(False)
+        finally:
+            self.select_all_cb.blockSignals(was_blocked)

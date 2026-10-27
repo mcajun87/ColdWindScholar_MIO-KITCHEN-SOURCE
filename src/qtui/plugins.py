@@ -1,0 +1,1888 @@
+import json
+import logging
+import os
+import platform
+import tempfile
+import zipfile
+from io import BytesIO
+from io import StringIO
+from shutil import rmtree
+from threading import Event, Thread
+from typing import Any
+from urllib.parse import urlsplit
+
+import requests
+from PySide6.QtCore import Qt, QObject, Signal, QThread
+from PySide6.QtGui import QColor
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QApplication, QVBoxLayout, QHBoxLayout
+from PySide6.QtWidgets import QSizePolicy
+from PySide6.QtWidgets import QWidget, QFileDialog, QStackedWidget
+from qfluentwidgets import IconWidget, CardWidget, BodyLabel, FluentIcon, ScrollArea, \
+    SearchLineEdit, TitleLabel, TransparentDropDownToolButton, RoundMenu, Action, InfoBar, InfoBarPosition, \
+    GroupHeaderCardWidget, LineEdit, SwitchButton, RadioButton, SegmentedWidget, InfoBarIcon
+from qfluentwidgets import (MessageBoxBase, SubtitleLabel, CaptionLabel, TextBrowser,
+                            PushButton)
+from qfluentwidgets import (ProgressBar, ImageLabel)
+
+from src.qtui.widgets import GenericTaskWorker
+from src.core import imp
+from src.core import utils
+from src.core.Magisk import Magisk_patch
+from src.core.addon_register import loader, Entry
+from src.core.avb_disabler import process_fstab
+from src.core.config_parser import ConfigParser
+from src.core.encryption_disabler import process_fstab_for_encryption
+from src.core.qsb_imger import process_by_xml
+from src.core.selinux_audit_allow import main as selinux_audit_allow
+from src.core.utils import ModuleErrorCodes, prog_path, call, temp, re_folder
+from src.core.xtc_recovery_helper import decrypt as decrypt_xtc
+from src.porttool import MyUI
+from src.qtui.plugin_allow_selinux_audit import AllowSELinuxAuditMessageBox
+from src.qtui.plugin_byte_calc import FileBytesMessageBox
+from src.qtui.plugin_decrypt_xtc_xml import DecryptXtcXmlMessageBox
+from src.qtui.plugin_dis_avb_in_fstab import DisableAvbMessageBox
+from src.qtui.plugin_dis_encryption_in_fstab import DisableEncryptionMessageBox
+from src.qtui.plugin_get_file_info import FileInfoMessageBox
+from src.qtui.plugin_magisk_patch import MagiskPatchDialog
+from src.qtui.plugin_merge_qcom_partitions import MergeQualcommImageMessageBox
+from src.qtui.plugin_merge_super import MergeImageDialog
+from src.qtui.plugin_trim_raw_image import TrimRawImageMessageBox
+from src.qtui.projects import project_manger
+from src.qtui.settings import cfg
+
+module_exec = os.path.join(prog_path, 'bin', "exec.sh").replace(os.sep, '/')
+module_error_codes = ModuleErrorCodes
+
+
+class ParseMessageBox(MessageBoxBase):
+    def __init__(self, json_file_path, parent=None):
+        super().__init__(parent)
+        self.gavs = {}
+        self.cancel = False
+        self.w_assert = "False"
+
+        # ─── 主布局结构 (严格垂直排列) ───
+        main_widget = QWidget(self)
+        self.main_layout = QVBoxLayout(main_widget)
+        self.main_layout.setContentsMargins(16, 16, 16, 16)
+        self.main_layout.setSpacing(12)
+
+        # 解析并生成动态 UI
+        self.load_json_schema(json_file_path)
+
+        self.viewLayout.addWidget(main_widget)
+        self.widget.setMinimumWidth(500)
+
+    def load_json_schema(self, path):
+        try:
+            with open(path, 'r', encoding='UTF-8') as f:
+                data = json.load(f)
+        except Exception:
+            logging.exception("Parser")
+            InfoBar.error("Parser", self.tr("JSON load failed"), parent=self.parent())
+            self.reject()
+            logging.exception('Parser')
+            return
+
+        info = data['main']['info']
+        self.w_assert = info.get('assert', "False")
+
+        # 1. 顶部主标题 (从主布局垂直向下排)
+        self.custom_title = BodyLabel(info.get('title', self.tr('Dynamic Panel')), self)
+        self.custom_title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        self.main_layout.addWidget(self.custom_title)
+
+        # 2. 遍历生成卡片组 (容器内部也采用严格垂直布局)
+        for group_name, group_data in data['main'].items():
+            if group_name == 'info':
+                continue
+
+            card = GroupHeaderCardWidget(self)
+            card.setContentsMargins(5, 5, 5, 5)
+            card.setTitle(group_data.get('title', self.tr('Group Panel')))
+
+            # 使用干净的垂直布局引擎包裹卡片内部的组件
+            v_container = QWidget()
+            card_v_layout = QVBoxLayout(v_container)
+            card_v_layout.setContentsMargins(0, 0, 0, 0)
+            card_v_layout.setSpacing(14)  # 控制垂直组件之间的间距
+
+            # 遍历动态解析 controls 内部的各项组件
+            for con in group_data.get('controls', []):
+                con_type = con.get('type')
+                method_name = f"_{con_type}"
+
+                if hasattr(self, method_name):
+                    control_factory = getattr(self, method_name)
+                else:
+                    control_factory = self.__unknown
+
+                control_factory(card_v_layout, con)
+
+            card.viewLayout.addWidget(v_container)
+            self.main_layout.addWidget(card)
+
+        # 3. 底部操作按钮栏 (铺满底部的 OK 按钮)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 8, 0, 0)
+
+        self.custom_ok_btn = self.yesButton
+        self.custom_ok_btn.setText(self.tr("Run"))
+        self.custom_ok_btn.clicked.connect(self.accept)
+
+        self.main_layout.addLayout(button_row)
+
+    # ─── 严格垂直流（VBox）动态组件工厂 ───
+
+    def _text(self, layout, config):
+        """对应 JSON 中的文本组件，居中对齐"""
+        label = BodyLabel(config.get('text', ''))
+        fontsize = int(config.get('fontsize', 14))
+        label.setStyleSheet(f"font-size: {fontsize}px;")
+        label.setAlignment(Qt.AlignCenter)  # 居中对齐，契合解包界面样式
+        layout.addWidget(label)
+
+    def _filechose(self, layout, config):
+        """对应 JSON 中的文件选择组件（垂直排布：标签在上，输入框与浏览按钮在下）"""
+        v_box = QVBoxLayout()
+        v_box.setSpacing(6)
+
+        key = config.get('set')
+        self.gavs[key] = ""
+
+        label = BodyLabel(config.get('text', 'File:'))
+
+        # 输入框与浏览按钮水平并排
+        h_row = QHBoxLayout()
+        line_edit = LineEdit()
+        btn = PushButton(self.tr("Choose"))
+        btn.setFixedWidth(85)
+
+        line_edit.textChanged.connect(lambda text: self.gavs.__setitem__(key, text))
+
+        def pick_file():
+            path, _ = QFileDialog.getOpenFileName(self, self.tr("Choose a file"))
+            if path:
+                line_edit.setText(path)
+
+        btn.clicked.connect(pick_file)
+
+        h_row.addWidget(line_edit, 1)
+        h_row.addWidget(btn)
+
+        v_box.addWidget(label)
+        v_box.addLayout(h_row)
+        layout.addLayout(v_box)
+
+    def _input(self, layout, config):
+        """对应 JSON 中的输入框组件（垂直排布：标签在上，输入框在下）"""
+        v_box = QVBoxLayout()
+        v_box.setSpacing(6)
+
+        key = config.get('set')
+        self.gavs[key] = ""
+
+        text = config.get('text', 'None')
+        if text != 'None':
+            label = BodyLabel(text)
+            v_box.addWidget(label)
+
+        line_edit = LineEdit()
+        line_edit.textChanged.connect(lambda val: self.gavs.__setitem__(key, val))
+
+        v_box.addWidget(line_edit)
+        layout.addLayout(v_box)
+
+    def _button(self, layout, config):
+        btn = PushButton(config.get('text', 'Button'))
+        command_str = config.get('command', '')
+        btn.clicked.connect(lambda: exec(command_str, globals(), locals()))
+        layout.addWidget(btn)
+
+    def _radio(self, layout, config):
+        v_box = QVBoxLayout()
+        v_box.setSpacing(6)
+        key = config.get('set')
+        options = config.get('opins', '').split()
+        self.gavs[key] = ""
+
+        for op in options:
+            if '|' not in op:
+                continue
+            text, val = op.split('|')
+            rb = RadioButton(text)
+            rb.toggled.connect(lambda checked, v=val: self.gavs.__setitem__(key, v) if checked else None)
+            v_box.addWidget(rb)
+        layout.addLayout(v_box)
+
+    def _checkbutton(self, layout, config):
+        key = config.get('set')
+        self.gavs[key] = 0
+        text = config.get('text', '')
+        text = '' if text == 'None' else text
+
+        switch = SwitchButton(text)
+        switch.checkedChanged.connect(lambda checked: self.gavs.__setitem__(key, 1 if checked else 0))
+        layout.addWidget(switch)
+
+    def __unknown(self, layout, config):
+        self.cancel = self.w_assert in ['true', 'True', '1', 'Yes', 'yes']
+        con_type = config.get('type', 'Unknown')
+        label = BodyLabel(self.tr("Unsupported Widget：{}").format(con_type))
+        label.setStyleSheet("color: #ff4d4f; font-weight: bold;")
+        layout.addWidget(label)
+
+    def closeEvent(self, event):
+        self.cancel = True
+        super().closeEvent(event)
+
+
+class ModuleManager(QObject):
+    def __init__(self, /):
+        super().__init__()
+        self.module_dir = os.path.join(prog_path, "bin", "module")
+        self.addon_loader = loader
+        self.addon_entries = Entry
+        self.master = None
+        Thread(target=self.load_plugins, daemon=True).start()
+
+    def is_installed(self, id_) -> bool:
+        path = os.path.join(self.module_dir, id_)
+        if os.path.exists(path) and os.path.isdir(path):
+            if os.path.exists(os.path.join(path, 'info.json')):
+                return True
+        return False
+
+    def is_virtual(self, id_) -> bool:
+        return id_ in self.addon_loader.virtual.keys()
+
+    def get_name(self, id_) -> str:
+        if self.is_virtual(id_):
+            return self.addon_loader.virtual[id_].get("name", id_)
+        return self.get_info(id_, 'name') or id_
+
+    def list_packages(self):
+        for i in os.listdir(self.module_dir):
+            if self.is_installed(i):
+                if os.path.isdir(os.path.join(self.module_dir, i)):
+                    yield i
+
+    def register_plugin(self, id_: str):
+        script_path = f"{self.module_dir}/{id_}"
+        if os.path.exists(f"{script_path}/main.py") and imp:
+            try:
+                module = imp.load_source(id_, f"{script_path}/main.py")
+                if hasattr(module, 'entrances'):
+                    for entry, func in module.entrances.items():
+                        self.addon_loader.register(id_, entry, func)
+                elif hasattr(module, 'main'):
+                    self.addon_loader.register(id_, self.addon_entries.main, module.main)
+                else:
+                    if self.master:
+                        InfoBar.warning(self.master.tr("Manager"),
+                                        f"Can't registry Module {self.get_name(id_)} as Plugin, Check if entrances or main function in it.",
+                                        parent=self.master)
+                    else:
+                        logging.warning(
+                            f"Can't registry Module {self.get_name(id_)} as Plugin, Check if entrances or main function in it.")
+            except Exception as e:
+                logging.error(f"Load Failed '{self.get_name(id_)}' path '{script_path}/main.py': {e}")
+                logging.exception('Bugs')
+
+    def load_plugins(self):
+        if not os.path.exists(self.module_dir) or not os.path.isdir(self.module_dir):
+            os.makedirs(self.module_dir, exist_ok=True)
+        for i in self.list_packages():
+            self.register_plugin(i)
+
+    def get_info(self, id_: str, item: str | None = None, default: str | None = None) -> str | dict[Any, Any] | Any:
+        if not default:
+            default = {}
+        info_file = f'{self.module_dir}/{id_}/info.json'
+        if not os.path.exists(info_file):
+            return default
+        try:
+            with open(info_file, 'r', encoding='UTF-8') as f:
+                return json.load(f).get(item, default) if item else json.load(f)
+        except json.JSONDecodeError:
+            logging.error(f"Error decoding JSON from {info_file} for plugin {id_}")
+            return default
+        except Exception as e:
+            logging.error(f"Error reading info file {info_file} for plugin {id_}: {e}")
+            return default
+
+    def run(self, id_=None) -> int:
+        if not id_:
+            return 0
+        if not cfg.currentProjectName.value:
+            InfoBar.warning(self.tr("Run Plugin"), self.tr("Please set a project"), parent=self.master)
+            return 1
+        if id_:
+            value = id_
+        else:
+            InfoBar.warning(self.tr("Run Plugin"), self.tr("id is invalid"), parent=self.master)
+            return 1
+        script_path = os.path.join(self.module_dir, value)
+
+        if not self.is_virtual(id_):
+            name = self.get_name(id_)
+            info_json_path = os.path.join(script_path, "info.json")
+            if not os.path.exists(info_json_path):
+                logging.error(f"run: info.json not found for plugin {id_} at {info_json_path}")
+                events.show_info_bar.emit(self.tr("Warning"), self.tr(f"Plugin {name} configuration is missing."), 2, 3500)
+                return 3
+
+            try:
+                with open(info_json_path, 'r', encoding='UTF-8') as f:
+                    data = json.load(f)
+            except json.JSONDecodeError:
+                logging.error(f"run: Could not decode info.json for plugin {id_}")
+                print(f"Plugin {name} configuration is corrupted.")
+                return 4
+            except Exception as e:
+                logging.error(f"run: Error reading info.json for plugin {id_}: {e}")
+                print(f"Error accessing plugin {name} configuration.")
+                return 5
+
+            dependencies = data.get('depend', '')
+            for n in dependencies.split():
+                if n and not os.path.exists(os.path.join(self.module_dir, n)):
+                    print("%s depends on %s，but %s is not installed" % (name, n, n))
+                    return 2
+
+        main_json_path = os.path.join(script_path, "main.json")
+        values = {}
+        if os.path.exists(main_json_path) and self.master:
+            values_parser = ParseMessageBox(main_json_path, self.master)
+            if values_parser.exec():
+                if values_parser.cancel:
+                    return 2
+                values = values_parser.gavs
+            else:
+                return 2
+        else:
+            logging.warning("Cannot execute gui plugin, because master not set or json not exists.")
+
+        main_sh_path = os.path.join(script_path, "main.sh")
+        main_py_path = os.path.join(script_path, "main.py")
+
+        if os.path.exists(main_sh_path):
+            if not os.path.exists(temp):
+                re_folder(temp)
+            exports: dict = dict()
+            if values:
+                for va, string_var in values.items():
+                    if string_var:
+                        exports[va] = string_var
+
+            norm_tool_bin = os.path.normpath(cfg.tool_bin).replace(os.sep, '/')
+            norm_script_path = os.path.normpath(script_path).replace(os.sep, '/')
+            norm_module_dir = os.path.normpath(self.module_dir).replace(os.sep, '/')
+            norm_project_output = os.path.normpath(project_manger.current_work_output_path()).replace(os.sep, '/')
+            norm_project_work = os.path.normpath(project_manger.current_work_path()).replace(os.sep, '/')
+            norm_module_exec = os.path.normpath(module_exec).replace(os.sep, '/')
+            norm_main_sh_path = os.path.normpath(main_sh_path).replace(os.sep, '/')
+            exports['tool_bin'] = norm_tool_bin
+            exports['version'] = cfg.Version.value
+            exports['language'] = cfg.language.value
+            exports['bin'] = norm_script_path
+            exports['moddir'] = norm_module_dir
+            exports['project_output'] = norm_project_output
+            exports['project'] = norm_project_work
+
+            shell_command_prefix = 'ash' if os.name == 'posix' else 'bash'
+            full_shell_command = f"exec {norm_module_exec} {norm_main_sh_path}"
+
+            call_result = call(["busybox", shell_command_prefix, '-c', full_shell_command], env=exports)
+            return call_result
+
+        elif os.path.exists(main_py_path) and imp:
+            if not self.addon_loader.is_registered(id_):
+                self.register_plugin(id_)
+            self.addon_loader.run(id_, Entry.main, mapped_args=values)
+        elif self.is_virtual(id_):
+            self.addon_loader.run(id_, Entry.main, mapped_args=values)
+        elif not os.path.exists(os.path.join(self.module_dir, value)):
+            events.show_info_bar.emit(self.tr("Warning"), self.tr("{} is not installed or broken.").format(value), 2, 3500)
+        else:
+            events.show_info_bar.emit(self.tr("Warning"), self.tr("{} is not executable").format(self.get_name(id_)), 2,
+                                      3500)
+        return 0
+
+    @staticmethod
+    def check_mpk(mpk):  # Move check progress from InstallMpk to this
+        #todo: move some logic of check mpk from install to this.
+        if not mpk or not os.path.exists(mpk) or not zipfile.is_zipfile(mpk):
+            return module_error_codes.IsBroken, ''
+        try:
+            with zipfile.ZipFile(mpk) as f:
+                f_list = f.namelist()
+                if 'info' not in f_list:
+                    return module_error_codes.IsBroken, 'Missing info file'
+                if 'icon' not in f_list:
+                    return module_error_codes.Normal, 'Missing icon file, use default'
+        except zipfile.BadZipFile:
+            return module_error_codes.IsBroken, 'Corrupted MPK archive'
+        return module_error_codes.Normal, ''
+
+    def install(self, mpk_path):
+        logging.info(f"ModuleManager.install: Starting installation from MPK: {mpk_path}")
+        check_mpk_result, reason = self.check_mpk(mpk_path)
+        if check_mpk_result != module_error_codes.Normal:
+            logging.error(
+                f"ModuleManager.install: MPK check failed for '{mpk_path}'. Result: {check_mpk_result}, Reason: '{reason}'")
+            return check_mpk_result, reason
+
+        mconf = ConfigParser()
+        try:
+            with zipfile.ZipFile(mpk_path) as f:
+                with f.open('info') as info_file:
+                    mconf.read_string(info_file.read().decode('utf-8'))
+            logging.debug(f"ModuleManager.install: Successfully read 'info' from MPK '{mpk_path}'.")
+        except Exception as e:
+            logging.exception(f"ModuleManager.install: Error reading 'info' from MPK '{mpk_path}': {e}")
+            return module_error_codes.IsBroken, "Error reading MPK info file"
+
+        install_id = mconf.get('module', 'identifier', None)
+
+        if not install_id:
+            logging.error(f"ModuleManager.install: Plugin identifier missing in 'info' of MPK '{mpk_path}'.")
+            return module_error_codes.IsBroken, "Missing identifier in plugin info"
+        logging.debug(f"ModuleManager.install: Plugin ID: '{install_id}'.")
+
+        try:
+            supports_str = mconf.get('module', 'supports', '')
+            supports = supports_str.split() if supports_str else []
+            if supports and platform.system() not in supports:
+                logging.warning(
+                    f"ModuleManager.install: Platform not supported for plugin '{install_id}'. Required: {supports}, Current: {platform.system()}")
+                return module_error_codes.PlatformNotSupport, f"Unsupported platform: {platform.system()}"
+        except Exception as e:
+            logging.exception(f"ModuleManager.install: Error checking platform support for '{install_id}': {e}")
+        system_target = mconf.get("module", 'system', 'all')
+        if system_target != 'all':
+            if platform.system() not in system_target.split(" "):
+                return module_error_codes.PlatformNotSupport, f"Unsupported platform: {system_target}"
+        arch_target = mconf.get("module", 'arch', 'all')
+        if arch_target != 'all':
+            if platform.machine() not in arch_target.split(" "):
+                return module_error_codes.ArchNotSupported, f"Unsupported Arch: {arch_target}"
+        depend_str = mconf.get('module', 'depend', '')
+        logging.debug(f"ModuleManager.install: Dependencies for '{install_id}': '{depend_str}'")
+        for dep_id_str in depend_str.split():
+            if dep_id_str and not os.path.isdir(os.path.join(self.module_dir, dep_id_str)):
+                logging.warning(
+                    f"ModuleManager.install: Dependency '{dep_id_str}' for plugin '{install_id}' is missing.")
+                return module_error_codes.DependsMissing, dep_id_str
+
+        install_target_path = os.path.join(self.module_dir, install_id)
+        logging.info(f"ModuleManager.install: Target install path for '{install_id}': '{install_target_path}'")
+
+        if os.path.exists(install_target_path):
+            logging.info(f"ModuleManager.install: Existing installation found at '{install_target_path}'. Removing it.")
+            try:
+                rmtree(install_target_path)
+                if os.path.exists(install_target_path):
+                    logging.error(
+                        f"ModuleManager.install: Failed to remove existing directory '{install_target_path}'.")
+                    return module_error_codes.GenericError, "Failed to remove old version"
+            except Exception as e_rm:
+                logging.exception(
+                    f"ModuleManager.install: Error removing existing directory '{install_target_path}': {e_rm}")
+                return module_error_codes.GenericError, "Error removing old version"
+
+        resource_file_name_in_mpk = mconf.get('module', 'resource', None)
+        if not resource_file_name_in_mpk:
+            logging.error(f"ModuleManager.install: 'resource' field missing in 'info' for plugin '{install_id}'.")
+            return module_error_codes.IsBroken, "Missing resource field in plugin info"
+        logging.debug(f"ModuleManager.install: Resource file name: '{resource_file_name_in_mpk}'.")
+
+        try:
+            with zipfile.ZipFile(mpk_path, 'r') as mpk_zip_file_obj:
+                if resource_file_name_in_mpk not in mpk_zip_file_obj.namelist():
+                    logging.error(
+                        f"ModuleManager.install: Resource file '{resource_file_name_in_mpk}' not found in MPK '{mpk_path}' for plugin '{install_id}'. Namelist: {mpk_zip_file_obj.namelist()}")
+                    return module_error_codes.IsBroken, "Resource file specified in info not found in MPK"
+
+                logging.debug(
+                    f"ModuleManager.install: Extracting resource '{resource_file_name_in_mpk}' for plugin '{install_id}'.")
+                with mpk_zip_file_obj.open(resource_file_name_in_mpk, 'r') as inner_resource_zip_stream:
+                    with zipfile.ZipFile(inner_resource_zip_stream, 'r') as resource_content_zip_obj:
+                        os.makedirs(install_target_path, exist_ok=True)
+                        logging.debug(
+                            f"ModuleManager.install: Contents of resource zip '{resource_file_name_in_mpk}': {resource_content_zip_obj.namelist()}")
+                        resource_content_zip_obj.extractall(install_target_path)
+                        logging.info(
+                            f"ModuleManager.install: Successfully extracted all contents of '{resource_file_name_in_mpk}' to '{install_target_path}'.")
+                        # Логирование извлеченных файлов
+                        if logging.getLogger().isEnabledFor(logging.DEBUG):
+                            extracted_items = []
+                            for root_dir, _, files_in_dir in os.walk(install_target_path):
+                                for file_item in files_in_dir:
+                                    extracted_items.append(os.path.join(root_dir, file_item))
+                            logging.debug(
+                                f"ModuleManager.install: Verifying extracted files in '{install_target_path}': {extracted_items if extracted_items else 'No files found (or directory is empty after extraction).'}")
+
+                plugin_info_data = {n: v for n, v in mconf.items('module')}
+                plugin_info_data['depend'] = depend_str
+
+                info_json_target_path = os.path.join(install_target_path, "info.json")
+                with open(info_json_target_path, 'w', encoding='utf-8') as f_json:
+                    json.dump(plugin_info_data, f_json, indent=2, ensure_ascii=False)
+                logging.debug(f"ModuleManager.install: Created info.json at '{info_json_target_path}'")
+
+                if 'icon' in mpk_zip_file_obj.namelist():
+                    icon_target_path = os.path.join(install_target_path, "icon")
+                    with open(icon_target_path, 'wb') as f_icon:
+                        with mpk_zip_file_obj.open('icon') as icon_stream:
+                            f_icon.write(icon_stream.read())
+                    logging.debug(f"ModuleManager.install: Extracted icon to '{icon_target_path}'")
+
+        except zipfile.BadZipFile as e_zip:
+            logging.exception(
+                f"ModuleManager.install: Bad ZIP file encountered (MPK or resource) for '{install_id}': {e_zip}")
+            return module_error_codes.IsBroken, "Corrupted archive"
+        except IOError as e_io:
+            logging.exception(f"ModuleManager.install: IOError during extraction for '{install_id}': {e_io}")
+            if os.path.exists(install_target_path):
+                try:
+                    rmtree(install_target_path)
+                except:
+                    pass
+            return module_error_codes.GenericError, f"IO Error: {e_io}"
+        except Exception as e_extract:
+            logging.exception(
+                f"ModuleManager.install: Error during extraction or file operations for '{install_id}': {e_extract}")
+            if os.path.exists(install_target_path):
+                try:
+                    rmtree(install_target_path)
+                except:
+                    pass
+            return module_error_codes.GenericError, f"Extraction error: {e_extract}"
+
+        logging.info(f"ModuleManager.install: Successfully installed plugin '{install_id}' to '{install_target_path}'.")
+        return module_error_codes.Normal, ""
+
+    def export(self, id_: str):
+
+        name: str = self.get_name(id_)
+        name = name.replace('/', '')
+        if self.is_virtual(id_):
+            print(f"{name} is a virtual plugin!")
+            return 1
+        if not id_:
+            print("no such plugin!")
+            return 1
+
+        plugin_dir_path = os.path.join(self.module_dir, id_)
+        info_json_path = os.path.join(plugin_dir_path, "info.json")
+
+        if not os.path.exists(info_json_path):
+            print(f"Error: info.json not found for plugin {id_}")
+            return 2
+
+        with open(info_json_path, 'r', encoding='UTF-8') as f:
+            data: dict = json.load(f)
+            data.setdefault('resource', "main.zip")
+            (info_ := ConfigParser())['module'] = data
+
+            buffer_info_ini = StringIO()
+            info_.write(buffer_info_ini)
+            info_ini_content = buffer_info_ini.getvalue()
+            buffer_info_ini.close()
+
+        buffer_resource_zip = BytesIO()
+        with zipfile.ZipFile(buffer_resource_zip, 'w', compression=zipfile.ZIP_DEFLATED,
+                             allowZip64=True) as resource_zip_file:
+            for item_path_abs in utils.get_all_file_paths(plugin_dir_path):
+                if os.path.basename(item_path_abs) in ['info.json', 'icon']:
+                    continue
+
+                arcname = os.path.relpath(item_path_abs, plugin_dir_path)
+                print(f"Adding:{arcname}")
+                try:
+                    resource_zip_file.write(str(item_path_abs), arcname=arcname)
+                except Exception as e:
+                    logging.exception(f'Error writing {item_path_abs} to resource zip')
+                    print("Error caused while writing {} ：{}".format(item_path_abs, e))
+
+        resource_zip_content = buffer_resource_zip.getvalue()
+        buffer_resource_zip.close()
+        output_mpk_path = os.path.join(cfg.workingFolder.value, f"{name}.mpk")
+        with zipfile.ZipFile(output_mpk_path, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as mpk_final_file:
+            mpk_final_file.writestr(data['resource'], resource_zip_content)
+            mpk_final_file.writestr('info', info_ini_content)
+
+            icon_path = os.path.join(plugin_dir_path, 'icon')
+            if os.path.exists(icon_path):
+                mpk_final_file.write(icon_path, 'icon')
+
+        if os.path.exists(output_mpk_path):
+            print(output_mpk_path, "Done")
+        else:
+            print(output_mpk_path, "Fail")
+        return None
+
+
+module_manager = ModuleManager()
+
+
+class UninstallMpk(MessageBoxBase):
+    def __init__(self, id_: str, wait=False, parent=None):
+        # We inherit MessageBoxBase which provides a beautifully engineered frameless window wrapper
+        super().__init__(parent)
+
+        self.arr = {}
+        self.uninstall_b = None
+        self.wait = wait
+
+        self.value = id_
+        self.value2 = None
+        self.check_pass = False
+
+        self.module_dir = module_manager.module_dir
+        # Execute your core backend validation checks
+        if id_ and module_manager.is_installed(id_):
+            self.check_pass = True
+            self.value2 = module_manager.get_name(id_)
+            self.lsdep()
+        elif id_:
+            self.value2 = id_
+            logging.warning(f"UninstallMpk init: Plugin with ID '{id_}' not found by module_manager.get_installed.")
+
+        # Dynamically build up components and text formats
+        self.ask()
+
+        # MessageBoxBase handles modal blocking natively with .exec() instead of wait_window()
+        # If wait parameter is required downstream, trigger it inside the initialization
+        if self.wait:
+            self.exec()
+
+    def ask(self):
+        # Apply window title
+        self.widget.setMinimumWidth(440)
+
+        # Delete default box buttons so we can insert custom full-width controls
+        self.buttonLayout.deleteLater()
+
+        # Build dynamic content warning strings
+        plugin_name = self.value2 or self.value
+        if plugin_name is None:
+            plugin_name = self.tr("Unknown Plugin")
+
+        if not self.value:
+            message_text = self.tr("Please select a plugin!")
+        elif not self.check_pass:
+            message_text = self.tr("Plugin '{}' not found or cannot be uninstalled.").format(plugin_name)
+        elif module_manager.is_virtual(self.value):
+            message_text = self.tr("Plugin '{}' is virtual and cannot be uninstalled this way.").format(plugin_name)
+        else:
+            message_text = self.tr("Are you sure you want to uninstall plugin '{}'?").format(plugin_name)
+
+        # Primary warning header (Replaces Tkinter Label with auto-wrapping Fluent label)
+        self.msgLabel = SubtitleLabel(message_text, self)
+        self.msgLabel.setAlignment(Qt.AlignCenter)
+        self.msgLabel.setWordWrap(True)
+        self.viewLayout.addWidget(self.msgLabel)
+
+        # Dependencies sub-interface (Only visible if secondary broken dependencies exist)
+        if self.arr:
+            self.depHeader = CaptionLabel(self.tr("The following dependent plugins will also be removed:"),
+                                          self)
+            self.depHeader.setTextColor(QColor("#ffffff"), QColor("#ffffff"))
+            self.viewLayout.addWidget(self.depHeader)
+
+            # Elegant, borderless scrolling viewport inside Fluent ecosystem
+            self.dependent_text_widget = TextBrowser(self)
+            self.dependent_text_widget.setReadOnly(True)
+            self.dependent_text_widget.setMaximumHeight(120)
+
+            # Format and inject text lines
+            dep_content = ""
+            for dep_id, dep_name in self.arr.items():
+                dep_content += f"• {dep_name} ({dep_id})\n"
+            self.dependent_text_widget.setText(dep_content.strip())
+            self.viewLayout.addWidget(self.dependent_text_widget)
+
+        # Lower control bar setup
+        self.bottomLayout = QHBoxLayout()
+        self.bottomLayout.setContentsMargins(0, 10, 0, 0)
+        self.bottomLayout.setSpacing(12)
+
+        # Standard button actions
+        self.cancel_b = self.cancelButton
+        self.cancel_b.clicked.connect(self.reject)
+
+        # Conditional binding for validation check-passes
+        if self.check_pass and self.value and not module_manager.is_virtual(self.value):
+            self.uninstall_b = self.yesButton
+            self.uninstall_b.setText(self.tr("Uninstall"))
+            self.uninstall_b.clicked.connect(self.uninstall)
+
+        self.viewLayout.addLayout(self.bottomLayout)
+
+    def lsdep(self, name_to_check_deps_for=None):
+        """Recursive check module dependencies"""
+        if not name_to_check_deps_for:
+            name_to_check_deps_for = self.value
+
+        if not name_to_check_deps_for:
+            return
+
+        for installed_plugin_id in module_manager.list_packages():
+            if installed_plugin_id == name_to_check_deps_for:
+                continue
+            if installed_plugin_id in self.arr:
+                continue
+
+            dependencies_str: str = module_manager.get_info(installed_plugin_id, 'depend', '')
+            dependencies_list = dependencies_str.split()
+
+            if name_to_check_deps_for in dependencies_list:
+                dependent_plugin_name = module_manager.get_name(installed_plugin_id)
+                self.arr[installed_plugin_id] = dependent_plugin_name
+                self.lsdep(installed_plugin_id)
+
+    def uninstall(self):
+        if not self.uninstall_b:
+            self.reject()
+            return
+
+        self.uninstall_b.setEnabled(False)
+        # Replaces self.update_idletasks() to safely flush structural event frames instantly
+        QApplication.processEvents()
+
+        plugin_id_to_remove = self.value
+        plugin_show_name_to_remove = self.value2 if self.value2 else self.value
+
+        dependent_ids = list(self.arr.keys())
+        for dep_id in dependent_ids:
+            dep_name = self.arr.get(dep_id, dep_id)
+            self.remove(dep_id, dep_name)
+
+        self.remove(plugin_id_to_remove, plugin_show_name_to_remove)
+        self.accept()
+
+    def remove(self, name=None, show_name=''):
+        logging.debug(f"UninstallMpk.remove called for: {name} (shown as: {show_name})")
+
+        # 1. Parameter Validation Check
+        if not name:
+            logging.warning("UninstallMpk.remove: 'name' (plugin ID) is None or empty.")
+            return
+
+        module_path = os.path.join(self.module_dir, str(name))
+        plugin_successfully_removed_fs = False
+
+        # 2. Update Button Text Dynamically (Uninstallation in progress)
+        if self.uninstall_b:
+            self.uninstall_b.setText(self.tr("Uninstalling：{}").format(show_name or name))
+            # Replaces self.update_idletasks() to instantly force visual updates to screen
+            QApplication.processEvents()
+
+        # 3. File System Removal Process
+        if os.path.exists(module_path):
+            try:
+                rmtree(module_path)
+                if not os.path.exists(module_path):
+                    plugin_successfully_removed_fs = True
+                    logging.info(f"Successfully removed directory: {module_path}")
+                else:
+                    logging.warning(
+                        f"Directory {module_path} reported as existing after rmtree call for plugin '{name}', though no exception was raised.")
+                    if not os.path.exists(module_path):
+                        plugin_successfully_removed_fs = True
+                        logging.info(f"Re-check confirms directory {module_path} is actually gone.")
+
+            except PermissionError as e_perm:
+                logging.exception(f"PermissionError removing '{module_path}' for plugin '{name}': {e_perm}")
+
+            except Exception as e_generic:
+                logging.exception(f"Generic error removing '{module_path}' for plugin '{name}': {e_generic}")
+
+        else:
+            plugin_successfully_removed_fs = True
+            logging.info(
+                f"Module path '{module_path}' did not exist for plugin '{name}'. Assumed removed or not present on filesystem.")
+
+        # 4. Handle Post-Removal Interface Synchronization Updates
+        if not plugin_successfully_removed_fs and os.path.exists(module_path):
+
+            logging.warning(f"Directory '{module_path}' still exists after removal attempt for plugin '{name}'.")
+
+        elif plugin_successfully_removed_fs:
+            if self.uninstall_b:
+                self.uninstall_b.setText(self.tr("Uninstall {} Done！").format(show_name or name))
+                QApplication.processEvents()
+
+            logging.info(f"Plugin '{name}' (DisplayName: '{show_name}') considered removed from filesystem.")
+
+        logging.debug(f"UninstallMpk.remove completed for: {name}")
+
+
+class InstallMpk(MessageBoxBase):
+    """基于 PySide6 + Fluent-Widgets 的 MPK 插件安装器窗口"""
+
+    def __init__(self, mpk_path: str = None, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        # 1. 迁移原始状态变量与配置解析器
+        # (假设 lang, module_manager, module_error_codes, images 等全局对象已在外部 import)
+        self.mconf = ConfigParser()
+        self.installable = True
+        self.mpk = mpk_path
+
+        # 2. 初始化 Fluent 核心界面样式（无 QSS）
+        self.widget.setMinimumWidth(540)
+        self.widget.setMinimumHeight(420)
+        self.buttonLayout.deleteLater()  # 废弃默认按钮组，改用下方通栏布局
+
+        # 3. 构建左右分栏布局
+        self.centerLayout = QHBoxLayout()
+        self.centerLayout.setContentsMargins(10, 15, 10, 15)
+        self.centerLayout.setSpacing(24)
+
+        # 左侧面板 (元数据)
+        self.leftPanel = QVBoxLayout()
+        self.leftPanel.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.leftPanel.setSpacing(12)
+
+        self.logo = ImageLabel(self)
+        self.logo.setFixedSize(128, 128)  # 契合您原代码的 128x128 尺寸
+
+        # 初始化占位文本（防止 load 失败前读出空值引发视觉报错）
+        self.name_label = SubtitleLabel("", self)
+        self.version = CaptionLabel("", self)
+        self.author = CaptionLabel("", self)
+
+        self.version.setTextColor(QColor("#b0b0b0"), QColor("#b0b0b0"))
+        self.author.setTextColor(QColor("#b0b0b0"), QColor("#b0b0b0"))
+
+        self.leftPanel.addWidget(self.logo)
+        self.leftPanel.addWidget(self.name_label)
+        self.leftPanel.addWidget(self.version)
+        self.leftPanel.addWidget(self.author)
+
+        # 右侧面板 (详细介绍文本框)
+        self.text = TextBrowser(self)
+        self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.centerLayout.addLayout(self.leftPanel, stretch=2)
+        self.centerLayout.addWidget(self.text, stretch=5)
+
+        # 4. 底部控制布局 (进度条 + 状态标签 + 通栏按钮)
+        self.bottomLayout = QVBoxLayout()
+        self.bottomLayout.setContentsMargins(10, 0, 10, 10)
+        self.bottomLayout.setSpacing(12)
+
+        self.prog = ProgressBar(self)
+        self.prog.setFixedHeight(4)
+        # 对应 tkinter 初始态：mode='indeterminate'，这里通过设置 0-0 开启无限滑动跑马灯
+        self.prog.setRange(0, 0)
+        self.prog.hide()  # 初始未点击安装时先隐藏隐藏
+
+        self.state = SubtitleLabel(self.tr("Ready"), self)
+        self.state.setAlignment(Qt.AlignCenter)
+        self.installb = self.yesButton
+        self.installb.setText(self.tr("Install"))
+        self.installb.setFixedHeight(36)
+        self.installb.clicked.connect(self.install)
+
+        self.bottomLayout.addWidget(self.prog)
+        self.bottomLayout.addWidget(self.state)
+        self.viewLayout.addLayout(self.centerLayout, stretch=1)
+        self.viewLayout.addLayout(self.bottomLayout)
+        self.load()
+        self.finished.connect(self.parent.load_plugin_cards)
+
+    def validate(self):
+        return self.installb.text() == self.tr("Done")
+
+    def install(self):
+        """核心安装逻辑与状态码转换"""
+        # 逻辑 1：如果按钮字样变成了“完成/关闭”，则点击直接退出销毁
+        if self.installb.text() == self.tr("Done"):
+            self.accept()  # 对应原代码：self.destroy()
+            return 0
+
+        # 逻辑 2：启动无确定时长的跑马灯进度动画
+        self.prog.show()
+        self.installb.setEnabled(False)  # 对应原代码：state=DISABLED
+
+        # 逻辑 3：调用您的后端管理器执行具体业务
+        ret, reason = module_manager.install(self.mpk)
+
+        # 逻辑 4：原汁原味的状态码映射分支
+        if ret == module_error_codes.ArchNotSupported:
+            self.state.setText(reason)
+        elif ret == module_error_codes.PlatformNotSupport:
+            self.state.setText(self.tr("Unsupported System {}").format(platform.system()))
+        elif ret == module_error_codes.DependsMissing:
+            self.state.setText(
+                self.tr("%s Depends on %s，but %s not installed") % (self.mconf.get('module', 'name'), reason, reason))
+            self.installb.setText(self.tr("Retry"))
+            self.installb.setEnabled(True)
+        elif ret == module_error_codes.IsBroken:
+            self.state.setText(self.tr("The plugin's broken."))
+            self.installb.setText(self.tr("Retry"))
+            self.installb.setEnabled(True)
+        elif ret == module_error_codes.Normal:
+            events.plugin_installed.emit(self.mconf.get('module', 'identifier'))
+            self.state.setText(self.tr("Installed"))
+            self.installb.setText(self.tr("Done"))
+            self.installb.setEnabled(True)
+
+        # 逻辑 5：安装动作完结，将进度条强行修正为 100% 满格静态长条
+        self.prog.setRange(0, 100)
+        self.prog.setValue(100)
+        return 0
+
+    def load(self):
+        """解析 MPK 压缩文件，在内存中提炼出数据与图标"""
+        if not self.mpk or not zipfile.is_zipfile(self.mpk):
+            self.unavailable()
+            return
+
+        try:
+            with zipfile.ZipFile(self.mpk, 'r') as myfile:
+                if 'info' not in myfile.namelist():
+                    self.unavailable()
+                    return
+                # 读取说明配置
+                with myfile.open('info') as info_file:
+                    self.mconf.read_string(info_file.read().decode('utf-8'))
+
+                # 读取并处理二进制图片
+                try:
+                    with myfile.open('icon') as myfi:
+                        self.icon_bytes = myfi.read()
+                        pixmap = QPixmap()
+                        # 利用 loadFromData 避开外部临时磁盘转存，实现内存高效加载
+                        if pixmap.loadFromData(self.icon_bytes):
+                            self.pyt = pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        else:
+                            raise Exception("QPixmap parse fail")
+                except (Exception, KeyError):
+                    logging.exception('Bugs')
+                    self.pyt = QPixmap()
+        except (Exception, BaseException):
+            logging.exception('Bugs')
+            self.pyt = QPixmap()
+
+        # 更新 Fluent UI 组件展示
+        self.name_label.setText(self.mconf.get('module', 'name'))
+        self.logo.setPixmap(self.pyt)
+        self.author.setText(self.tr("Author：{}").format(self.mconf.get('module', 'author')))
+        self.version.setText(self.tr("Version：{}").format(self.mconf.get('module', 'version')))
+        self.text.setText(self.mconf.get('module', 'describe'))
+
+    def unavailable(self):
+        """异常和包损坏时的界面安全降级逻辑"""
+        self.pyt = QPixmap()
+
+        self.name_label.setText(self.tr("PLease select a plugin"))
+        self.name_label.setTextColor(QColor("#ffcc00"), QColor("#ffcc00"))
+        self.logo.setPixmap(self.pyt)
+
+        self.author.hide()
+        self.version.hide()
+        self.prog.hide()
+        self.installb.setEnabled(False)
+
+
+class AppCardRich(CardWidget):
+
+    def __init__(self, icon, title: str, author: str, description: str = "", tags: list = None, parent=None):
+        super().__init__(parent)
+        self.iconWidget = IconWidget(icon)
+        self.titleLabel = BodyLabel(title, self)
+
+        # Primary label for plugin descriptions (supports text wrapping)
+        self.descriptionLabel = CaptionLabel(description, self)
+        self.descriptionLabel.setWordWrap(True)
+
+        # Subtitle layout to group Author and Metadata info (e.g., Windows, v1.0)
+        self.metaLayout = QHBoxLayout()
+        self.metaLayout.setContentsMargins(0, 0, 0, 0)
+        self.metaLayout.setSpacing(8)
+
+        # Author attribution label
+        self.authorLabel = CaptionLabel(author, self)
+        self.authorLabel.setStyleSheet("color: gray;")
+        self.metaLayout.addWidget(self.authorLabel)
+
+        # Dynamic metadata pill tags (e.g., 'Windows', 'Mac', 'Core')
+        if tags:
+            for tag_text in tags:
+                tag_label = CaptionLabel(tag_text, self)
+                # Adds a clean borderless background pill design native to Fluent UI
+                tag_label.setStyleSheet("""
+                    background-color: rgba(0, 0, 0, 0.06); 
+                    border-radius: 4px; 
+                    padding: 1px 6px; 
+                    color: rgba(0, 0, 0, 0.6);
+                """)
+                self.metaLayout.addWidget(tag_label)
+        self.metaLayout.addStretch(1)
+
+        self.openButton = PushButton(self.tr('Run'), self)
+        self.moreButton = TransparentDropDownToolButton(FluentIcon.MORE)
+
+        self.hBoxLayout = QHBoxLayout(self)
+        self.vBoxLayout = QVBoxLayout()
+
+        # Increased height from 73 to 95 to accommodate the description and tags cleanly
+        self.setFixedHeight(95)
+        self.iconWidget.setFixedSize(48, 48)
+        self.openButton.setFixedWidth(120)
+        self.hBoxLayout.setContentsMargins(20, 11, 11, 11)
+        self.hBoxLayout.setSpacing(15)
+        self.hBoxLayout.addWidget(self.iconWidget)
+
+        # Assemble text hierarchy column chronologically
+        self.vBoxLayout.setContentsMargins(0, 2, 0, 2)
+        self.vBoxLayout.setSpacing(2)
+
+        self.vBoxLayout.addWidget(self.titleLabel, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.vBoxLayout.addLayout(self.metaLayout)  # Dynamic metadata container row
+        self.vBoxLayout.addWidget(self.descriptionLabel, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.vBoxLayout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.hBoxLayout.addLayout(self.vBoxLayout, 1)  # Give text area stretch priority
+
+        self.hBoxLayout.addWidget(self.openButton, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.hBoxLayout.addWidget(self.moreButton, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+
+class RomDownloadWorker(QThread):
+    progress = Signal(int, int)
+    completed = Signal(str)
+    failed = Signal(str)
+    canceled = Signal()
+
+    def __init__(self, url: str, destination: str, cancel_event: Event, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.destination = destination
+        self.cancel_event = cancel_event
+
+    def run(self):
+        temporary_path = None
+        try:
+            with requests.get(self.url, stream=True, timeout=(10, 30)) as response:
+                response.raise_for_status()
+                total_size = int(response.headers.get("Content-Length", 0))
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=os.path.dirname(os.path.abspath(self.destination)),
+                    prefix=".rom-download-",
+                    delete=False
+                ) as output:
+                    temporary_path = output.name
+                    downloaded = 0
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if self.cancel_event.is_set():
+                            self.canceled.emit()
+                            return
+                        if chunk:
+                            output.write(chunk)
+                            downloaded += len(chunk)
+                            self.progress.emit(downloaded, total_size)
+
+            if total_size and downloaded != total_size:
+                raise IOError(f"Incomplete download: expected {total_size} bytes, received {downloaded}")
+            if not downloaded:
+                raise IOError("The server returned an empty file")
+            if self.cancel_event.is_set():
+                self.canceled.emit()
+                return
+
+            os.replace(temporary_path, self.destination)
+            temporary_path = None
+            self.completed.emit(self.destination)
+        except Exception as error:
+            self.failed.emit(str(error))
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    logging.exception("Failed to remove incomplete ROM download")
+
+
+class RomDownloadDialog(MessageBoxBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.download_path = ""
+        self.worker = None
+        self.cancel_event = None
+
+        self.title_label = BodyLabel(self.tr("Download ROM"), self)
+        self.title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        self.viewLayout.addWidget(self.title_label)
+        self.viewLayout.setSpacing(14)
+
+        description = BodyLabel(
+            self.tr("Download a ROM from a direct HTTP or HTTPS link to your computer."),
+            self
+        )
+        description.setWordWrap(True)
+        self.viewLayout.addWidget(description)
+
+        url_label = BodyLabel(self.tr("Download URL"), self)
+        self.viewLayout.addWidget(url_label)
+        self.url_edit = LineEdit()
+        self.url_edit.setPlaceholderText(self.tr("Direct HTTP or HTTPS ROM download URL"))
+        self.viewLayout.addWidget(self.url_edit)
+
+        destination_layout = QHBoxLayout()
+        self.destination_edit = LineEdit()
+        self.destination_edit.setPlaceholderText(self.tr("Save ROM as..."))
+        self.browse_button = PushButton(self.tr("Browse"), self)
+        self.browse_button.clicked.connect(self.choose_destination)
+        destination_layout.addWidget(self.destination_edit, 1)
+        destination_layout.addWidget(self.browse_button)
+        self.viewLayout.addWidget(BodyLabel(self.tr("Save location"), self))
+        self.viewLayout.addLayout(destination_layout)
+
+        self.progress_bar = ProgressBar(self)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.viewLayout.addWidget(self.progress_bar)
+        self.status_label = CaptionLabel(self.tr("Enter a direct download URL and choose a destination."), self)
+        self.status_label.setWordWrap(True)
+        self.viewLayout.addWidget(self.status_label)
+
+        self.yesButton.setText(self.tr("Download"))
+        self.yesButton.clicked.connect(self.start_download)
+        self.cancelButton.setText(self.tr("Cancel"))
+        self.widget.setMinimumWidth(520)
+
+    def validate(self):
+        return False
+
+    def choose_destination(self):
+        destination, _ = QFileDialog.getSaveFileName(
+            self, self.tr("Save ROM"), "", self.tr("ROM files (*.zip *.img);;All files (*)")
+        )
+        if destination:
+            self.destination_edit.setText(destination)
+
+    def start_download(self):
+        url = self.url_edit.text().strip()
+        destination = self.destination_edit.text().strip()
+        parsed_url = urlsplit(url)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+            self.status_label.setText(self.tr("Enter a valid HTTP or HTTPS URL."))
+            return
+        if not destination:
+            self.status_label.setText(self.tr("Choose where to save the ROM."))
+            return
+
+        self.download_path = destination
+        self.cancel_event = Event()
+        self.worker = RomDownloadWorker(url, destination, self.cancel_event, self)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.completed.connect(self.download_completed)
+        self.worker.failed.connect(self.download_failed)
+        self.worker.canceled.connect(self.download_canceled)
+        self.yesButton.setEnabled(False)
+        self.browse_button.setEnabled(False)
+        self.url_edit.setEnabled(False)
+        self.destination_edit.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText(self.tr("Connecting..."))
+        self.worker.start()
+
+    def update_progress(self, downloaded: int, total_size: int):
+        if total_size:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(min(downloaded * 100 // total_size, 100))
+            self.status_label.setText(
+                self.tr("{} of {} downloaded").format(utils.hum_convert(downloaded), utils.hum_convert(total_size))
+            )
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText(self.tr("{} downloaded").format(utils.hum_convert(downloaded)))
+
+    def download_completed(self, destination: str):
+        self.download_path = destination
+        self.worker.wait()
+        self.worker = None
+        self.accept()
+
+    def download_failed(self, error: str):
+        self.worker.wait()
+        self.worker = None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(self.tr("Download failed: {}").format(error))
+        self._set_controls_enabled(True)
+
+    def download_canceled(self):
+        self.worker.wait()
+        self.worker = None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(self.tr("Download canceled."))
+        if self.isVisible():
+            self._set_controls_enabled(True)
+        else:
+            self.reject()
+
+    def _set_controls_enabled(self, enabled: bool):
+        self.yesButton.setEnabled(enabled)
+        self.browse_button.setEnabled(enabled)
+        self.url_edit.setEnabled(enabled)
+        self.destination_edit.setEnabled(enabled)
+        self.cancelButton.setEnabled(True)
+        self.yesButton.setText(self.tr("Download"))
+        self.cancelButton.setText(self.tr("Cancel"))
+
+    def cancel_download(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_event.set()
+            self.cancelButton.setEnabled(False)
+            self.status_label.setText(self.tr("Canceling download..."))
+            return
+        self.reject()
+
+    def reject(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_event.set()
+            self.status_label.setText(self.tr("Canceling download..."))
+            return
+        super().reject()
+
+
+class BuiltInPlugins(QObject):
+    def __init__(self, master, /):
+        super().__init__(parent=master)
+        self.master = master
+        self.plugins = {
+            "download_rom": {"name": self.tr("Download ROM"), "entry": self.download_rom},
+            "get_file_info": {"name": self.tr("Get File Info"),
+                              "entry": lambda: FileInfoMessageBox(self.master).exec()},
+            "byte_calculator": {"name": self.tr("Byte Calculator"),
+                                "entry": lambda: FileBytesMessageBox(self.master).exec()},
+            "allow_selinux_audit": {"name": self.tr("Allow Selinux Audit"), "entry": self.allow_selinux_audit},
+            "dis_avb_in_fstab": {"name": self.tr("Disable avb in fstab"), "entry": self.disable_avb},
+            "dis_encryption": {"name": self.tr("Disable Encryption"), "entry": self.dis_encryption},
+            "trim_raw_image": {"name": self.tr("Trim Raw Image"), "entry": self.trim_raw_image},
+            "magisk_patch": {"name": self.tr("Magisk Patch"), "entry": self.magisk_patch},
+            "merge_qualcomm_image": {"name": self.tr("Merge Qualcomm Image"), "entry": self.merge_qcom_images},
+            "merge_super": {"name": self.tr("Merge Super"), "entry": self.merge_super},
+            "decrypt_xtc_xml": {"name": self.tr("Decrypt xtc xml"), "entry": self.decrypt_xtc_xml},
+            "mtk_port_tool": {"name": self.tr("Mtk Port Tool"), "entry": self.mtk_port_tool},
+        }
+
+    def exec_plugin(self, plugin_id: str):
+        if plugin_id not in self.plugins.keys():
+            print(f"No such plugin: {plugin_id}")
+            return
+        entry = self.plugins[plugin_id]["entry"]
+        if not callable(entry):
+            events.show_info_bar.emit(
+                self.tr("Warning"),
+                self.tr(f"{plugin_id} is not callable!"),
+                2, 5000
+            )
+            return
+        entry()
+
+    def download_rom(self):
+        dialog = RomDownloadDialog(self.master)
+        if dialog.exec():
+            InfoBar.success(
+                self.tr("Download complete"),
+                self.tr("ROM saved to {}").format(dialog.download_path),
+                parent=self.master
+            )
+
+    def mtk_port_tool(self):
+        dialog = MyUI(self.master)
+        if dialog.exec():
+            pass
+
+    def merge_super(self):
+        dialog = MergeImageDialog(self.master, os.path.join(cfg.workingFolder.value, cfg.currentProjectName.value))
+        if dialog.exec():
+            pass
+        #todo: rewrite in a good way.
+
+    def magisk_patch(self):
+        dialog = MagiskPatchDialog(self.master)
+        # print("Patch sequence initiated!")
+        #             print(f"Boot Path: {dialog.bootFileLineEdit.text()}")
+        #             print(f"APK Path: {dialog.magiskApkLineEdit.text()}")
+        #             print(f"Arch Mode: {dialog.archComboBox.currentText()}")
+        #             print(f"IS64BIT: {dialog.is64bitCheck.isChecked()}")
+        #             print(f"KEEPVERITY: {dialog.keepVerityCheck.isChecked()}")
+        #             print(f"KEEPFORCEENCRYPT: {dialog.keepForceEncryptCheck.isChecked()}")
+        #             print(f"RECOVERYMODE: {dialog.recoveryModeCheck.isChecked()}")
+        if dialog.exec():
+            local_path = str(os.path.join(temp, utils.v_code()))  # Generate a unique temporary working directory.
+            re_folder(local_path)  # I ensure the temporary folder is clean or created.
+            boot_path = dialog.bootFileLineEdit.text()
+            magisk_path = dialog.magiskApkLineEdit.text()
+            if not boot_path or not os.path.exists(boot_path):
+                InfoBar.warning(
+                    self.master.tr("Magisk Patch"), f"{boot_path}'s not exist", parent=self.master
+                )
+                return
+            if not magisk_path or not os.path.exists(magisk_path):
+                InfoBar.warning(
+                    self.master.tr("Magisk Patch"), f"{magisk_path}'s not exist", parent=self.master
+                )
+                return
+            try:
+                with Magisk_patch(boot_path, None, f"{cfg.tool_bin}/magiskboot", local_path,
+                                  dialog.is64bitCheck.isChecked(),
+                                  dialog.keepVerityCheck.isChecked(), dialog.keepForceEncryptCheck.isChecked(),
+                                  dialog.recoveryModeCheck.isChecked(),
+                                  magisk_path, dialog.archComboBox.currentText()
+                                  ) as m:
+                    m.auto_patch()  # Perform the automated patching process.
+                    if m.output:
+                        # I construct a unique output file name to avoid overwriting existing files.
+                        base_name = os.path.basename(boot_path)
+                        # Handle common image extensions like .img and .bin for name stripping.
+                        name_part = base_name
+                        for ext in ('.img', '.bin'):  # I check for common extensions.
+                            if base_name.lower().endswith(ext):
+                                name_part = base_name[:-len(ext)]
+                                break
+                        output_file = os.path.join(prog_path,
+                                                   f"{name_part}_magisk_patched.img")
+                        if os.path.exists(output_file):
+                            # If the default patched name exists, I add a unique code to the new one.
+                            output_file = os.path.join(prog_path,
+                                                       f"{name_part}_{utils.v_code()}_magisk_patched.img")
+                        os.rename(m.output, output_file)  # Move the patched file to the final destination.
+                        InfoBar.success(self.tr("Magisk Patch"), f"Patched Boot:\n{output_file}", parent=self.master)
+                    else:
+                        InfoBar.warning(self.tr("Magisk Patch"), self.tr("Magisk patching process did not produce an output file."),
+                                        parent=self.master)
+            except Exception as e:
+                # I log any exceptions during patching and inform the user.
+                logging.exception("Magisk patching error")
+                InfoBar.warning(self.master.tr("Magisk Patch"), f"Magisk patching failed: {str(e)}", parent=self.master)
+
+    def merge_qcom_images(self):
+        dialog = MergeQualcommImageMessageBox(self.master)
+        if dialog.exec():
+            result = dialog.get_form_data()
+            xml_path = result['xml_path']
+            partition = result['partition']
+            output_path = result['output_path']
+            if not os.path.exists(output_path): os.makedirs(output_path, exist_ok=True)
+            try:
+                process_by_xml(xml_path, partition, output_path)
+                # I inform the user of success.
+                InfoBar.success("Merged", 'Image merging completed successfully!', parent=self.master)
+            except Exception as e:
+                # I log the error and inform the user of failure.
+                print(f'Merge failed: {e}')
+                logging.exception('MergeQC RAWPROGRAM error')
+                InfoBar.warning(self.tr("Warning"), f'Image merging failed: {str(e)}',
+                                parent=self.master)  # Displaying the error message to the user.
+            # No explicit return None needed here as the function naturally returns None if no other return is hit.
+
+    def dis_encryption(self):
+        dialog = DisableEncryptionMessageBox(self.master)
+        if dialog.exec():
+            fstab_files = dialog.partitions_with_fstab
+            selected_parts = dialog.get_selected_partitions()
+            for name in selected_parts:
+                if name in fstab_files:
+                    for fstab_path in fstab_files[name]:
+                        process_fstab_for_encryption(fstab_path)
+                        InfoBar.success(self.tr("Disabled encryption"), f"Patched fstab at {name}", parent=self.master)
+
+    def disable_avb(self):
+        dialog = DisableAvbMessageBox(self.master)
+        if dialog.exec():
+            fstab_files = dialog.partitions_with_fstab
+            selected_parts = dialog.get_selected_partitions()
+            for name in selected_parts:
+                if name in fstab_files:
+                    for fstab_path in fstab_files[name]:
+                        process_fstab(fstab_path)
+                        InfoBar.success(self.master.tr("Disabled Avb"), f"Patched fstab at {name}", parent=self.master)
+
+    def allow_selinux_audit(self):
+        dialog = AllowSELinuxAuditMessageBox(self.master)
+        if dialog.exec():
+            input_log = dialog.log_path_edit.text()
+            output_dir = dialog.output_path_edit.text()
+            if not os.path.exists(input_log) or not os.path.exists(output_dir):
+                return
+            selinux_audit_allow(input_log, output_dir)
+            InfoBar.info(
+                title="Processing File",
+                content=f"Allowed {input_log}",
+                orient=Qt.Horizontal,
+                isClosable=False,
+                duration=3000,  # Kept active indefinitely
+                position=InfoBarPosition.TOP,
+                parent=self.master
+            )
+
+    def decrypt_xtc_xml(self):
+        dialog = DecryptXtcXmlMessageBox(self.master)
+        if dialog.exec():
+            path = dialog.file_path_edit.text()
+            if not os.path.exists(path) or not path.strip():
+                InfoBar.warning(title="Decrypt XTC Xml", content=self.master.tr('Please choose a path.'),
+                                parent=self.master)
+                return
+            for root, _, files in os.walk(path, topdown=True):
+                for f in files:
+                    if f.endswith('.xml'):
+                        InfoBar.info(
+                            title=self.master.tr("Processing File"),
+                            content=f"Decrypting {f}",
+                            orient=Qt.Horizontal,
+                            isClosable=False,
+                            duration=3000,  # Kept active indefinitely
+                            position=InfoBarPosition.TOP,
+                            parent=self.master
+                        )
+                        decrypt_xtc(os.path.join(root, f))
+
+    def trim_raw_image(self):
+        dialog = TrimRawImageMessageBox(self.master)
+        if dialog.exec():
+            file_path = dialog.file_path_edit.text()
+            if not os.path.exists(file_path):
+                return
+
+            def do_trim(buff_size: int = 8192, file_path: str | None = None):
+                if not file_path:
+                    return
+                orig_size = file_size = os.path.getsize(file_path)
+                zeros_ = bytearray(buff_size)
+                progress_bar = InfoBar.info(
+                    title=self.master.tr("Processing File"),
+                    content="Running - 0%",
+                    orient=Qt.Horizontal,
+                    isClosable=False,
+                    duration=-1,  # Kept active indefinitely
+                    position=InfoBarPosition.TOP,
+                    parent=self.master
+                )
+                with open(file_path, 'rb') as f:
+                    update_ui = 3000
+                    while file_size:
+                        n = min(file_size, buff_size)
+                        file_size_ = file_size - n
+                        f.seek(file_size_)
+                        buf = f.read(n)
+                        assert len(buf) == n
+                        if n != len(zeros_):
+                            zeros_ = bytearray(n)
+                        if buf != zeros_:
+                            for i, b in enumerate(reversed(buf)):
+                                if b != 0: break
+                            file_size -= i
+                            break
+                        file_size = file_size_
+
+                        update_ui -= 1
+                        if update_ui == 0:
+                            update_ui = 3000
+                            percentage = 100 - file_size * 100 // orig_size
+                            progress_bar.contentLabel.setText(f"Running - {percentage}%")
+                os.truncate(file_path, file_size)
+                c = orig_size - file_size
+                progress_bar.close()
+                InfoBar.success(
+                    title=self.tr("Success"),
+                    content=self.master.tr("总共从文件末尾截去了 %d 个零字节(~ %s)") % (c, utils.hum_convert(c)),
+                    position=InfoBarPosition.TOP,
+                    duration=4000,
+                    parent=self.master
+                )
+
+            do_trim(file_path=file_path)
+
+class Events(QObject):
+    download_signal = Signal(dict, str, bool)
+    plugin_installed = Signal(str)
+    load_plugin_cards = Signal()
+    show_info_bar = Signal(str, str, int, int)
+
+
+events = Events()
+class PluginPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PluginPage")
+        self.built_in_plugins = BuiltInPlugins(self)
+        self.local_db_path = os.path.join(prog_path, 'bin', 'plugin_db.json')
+        self.tasks = dict() #only to keep qthread alive
+        self.cards_data = []  # Tracks {"card_widget": card, "title": str, "author": str, "type": "Installed"|"Repo"}
+        self.download_status = {}
+        self.repo_cards = {}
+        self.initUI()
+
+        module_manager.master = self
+
+    def initUI(self):
+        # 1. Main outer layout
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(40, 40, 40, 40)
+        outer_layout.setSpacing(20)
+        events.download_signal.connect(self.set_download_status)
+        events.plugin_installed.connect(self.load_installed_plugin)
+        events.load_plugin_cards.connect(self.load_plugin_cards)
+        events.show_info_bar.connect(self.show_info_bar)
+        # 2. Header Layout (Title and Navigation)
+        header_layout = QHBoxLayout()
+        text_header_layout = QVBoxLayout()
+        title = TitleLabel(self.tr("Plugin"))
+        text_header_layout.addWidget(title)
+        header_layout.addLayout(text_header_layout)
+        header_layout.addStretch()
+
+        # Navigation Controller
+        self.SegmentedWidget = SegmentedWidget(self)
+        self.SegmentedWidget.setMaximumHeight(25)
+        self.SegmentedWidget.addItem(routeKey="Installed", text=self.tr("Installed"))
+        self.SegmentedWidget.addItem(routeKey="Repo", text=self.tr("Repo"))
+        self.SegmentedWidget.setCurrentItem("Installed")
+        header_layout.addWidget(self.SegmentedWidget)
+
+        self.local_install_btn = PushButton(FluentIcon.ADD, self.tr("Install"), self)
+        self.local_install_btn.clicked.connect(self.install_mpk)
+        header_layout.addWidget(self.local_install_btn)
+        outer_layout.addLayout(header_layout)
+
+        # 3. Search Bar Integration
+        self.search_bar = SearchLineEdit(self)
+        self.search_bar.setPlaceholderText(self.tr("Search plugins..."))
+        self.search_bar.setClearButtonEnabled(True)
+        self.search_bar.textChanged.connect(self.filter_plugins)
+        outer_layout.addWidget(self.search_bar)
+
+        # 4. View Presentation Stacked Management
+        self.stacked_widget = QStackedWidget(self)
+
+        # Setup Scroll Area for Installed Tab
+        self.scroll_area_installed = ScrollArea(self)
+        self.scroll_area_installed.setWidgetResizable(True)
+        self.scroll_area_installed.setFrameShape(ScrollArea.Shape.NoFrame)
+        self.scroll_area_installed.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area_installed.setStyleSheet("background: transparent")
+
+        self.scroll_content_installed = QWidget()
+        self.scroll_content_installed.setObjectName("ScrollContentPlugin")
+        self.installed_layout = QVBoxLayout(self.scroll_content_installed)
+        self.installed_layout.setContentsMargins(0, 5, 0, 0)
+        self.installed_layout.setSpacing(5)
+        self.installed_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll_area_installed.setWidget(self.scroll_content_installed)
+
+        # Setup Scroll Area for Repo Tab
+        self.scroll_area_repo = ScrollArea(self)
+        self.scroll_area_repo.setWidgetResizable(True)
+        self.scroll_area_repo.setFrameShape(ScrollArea.Shape.NoFrame)
+        self.scroll_area_repo.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area_repo.setStyleSheet("background: transparent")
+
+        self.scroll_content_repo = QWidget()
+        self.scroll_content_repo.setObjectName("ScrollContentPluginRepo")
+        self.repo_layout = QVBoxLayout(self.scroll_content_repo)
+        self.repo_layout.setContentsMargins(0, 5, 0, 0)
+        self.repo_layout.setSpacing(5)
+        self.repo_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll_area_repo.setWidget(self.scroll_content_repo)
+
+        # Register components onto structural views
+        self.stacked_widget.addWidget(self.scroll_area_installed)
+        self.stacked_widget.addWidget(self.scroll_area_repo)
+        outer_layout.addWidget(self.stacked_widget)
+
+        # Connect Navigation to Page Stacking Management
+        self.SegmentedWidget.currentItemChanged.connect(self.on_tab_changed)
+
+        # 5. Populate Cards Dynamically
+        self.load_plugin_cards()
+    def show_info_bar(self, title: str, content: str, bar_type: int = 3, duration=5000):
+        """bar_type: 1=error 2=warning 3=SUCCESS 4=INFO"""
+        icon_map = {
+            1: InfoBarIcon.ERROR,
+            2: InfoBarIcon.WARNING,
+            3: InfoBarIcon.SUCCESS,
+            4: InfoBarIcon.INFORMATION
+        }
+        InfoBar.new(icon=icon_map.get(bar_type, InfoBarIcon.INFORMATION),
+                    title=title,
+                    content=content,
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=duration,
+                    parent=self.parent())
+    def on_tab_changed(self, route_key):
+        """Manages stacked views changing and applies active filtering rules"""
+        if route_key == 'Installed':
+            self.stacked_widget.setCurrentWidget(self.scroll_area_installed)
+        else:
+            self.stacked_widget.setCurrentWidget(self.scroll_area_repo)
+            self.load_plugin_cards(refresh_installed=False)
+            return
+        self.filter_plugins(self.search_bar.text())
+
+    def _clear_layout(self, layout):
+        """Safely disposes components out of layout nodes to avoid leakage memory states"""
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def load_plugin_cards(self, refresh_installed=True):
+        self._clear_layout(self.repo_layout)
+        self.repo_cards.clear()
+        if refresh_installed:
+            self._clear_layout(self.installed_layout)
+            self.cards_data = []
+
+            # Populate INSTALLED Page: Built-In Modules
+            for plugin_id, plugin_info in self.built_in_plugins.plugins.items():
+                plugin_title = plugin_info.get("name", plugin_info.get("id", "Unknown"))
+                card = AppCardRich(
+                    icon=FluentIcon.APPLICATION,
+                    title=plugin_title,
+                    author="Mio-Kitchen",
+                    tags=[self.tr('Built-In Plugin')],
+                    parent=self.scroll_content_installed
+                )
+                card.moreButton.clicked.connect(lambda: print("None"))
+                card.openButton.clicked.connect(
+                    lambda state, pid=plugin_id: self.built_in_plugins.exec_plugin(pid))
+                card.clicked.connect(lambda pid=plugin_id: self.built_in_plugins.exec_plugin(pid))
+                self.installed_layout.addWidget(card)
+                self.cards_data.append({
+                    "card_widget": card,
+                    "title": plugin_title.lower(),
+                    "author": "mio-kitchen",
+                    "type": "Installed"
+                })
+
+            # Populate INSTALLED Page: Downloaded Local Directory Packages
+            for plugin_id in module_manager.list_packages():
+                plugin = module_manager.get_info(plugin_id)
+                plugin_icon = os.path.join(module_manager.module_dir, plugin_id, 'icon')
+                if not os.path.exists(plugin_icon):
+                    plugin_icon = FluentIcon.APPLICATION
+
+                plugin_title = plugin.get("name", plugin_id)
+                plugin_author = plugin.get("author", "未知作者")
+                card = AppCardRich(
+                    icon=plugin_icon,
+                    title=plugin_title,
+                    author=plugin_author,
+                    parent=self.scroll_content_installed,
+                    description=plugin.get("describe", ""),
+                    tags=[plugin.get('version', "1.0")]
+                )
+                menu = RoundMenu(parent=card.moreButton)
+                menu.addAction(Action(FluentIcon.CLOSE, self.tr('Uninstall'),
+                                      triggered=lambda state, pid=plugin_id: self.uninstall_plugin(pid)))
+                menu.addAction(Action(FluentIcon.ZOOM_OUT, self.tr('Export'),
+                                      triggered=lambda state, pid=plugin_id: module_manager.export(pid)))
+                menu.addAction(Action(FluentIcon.EDIT, self.tr('Edit'), triggered=lambda: print("Saved")))
+
+                card.moreButton.setMenu(menu)
+                card.openButton.clicked.connect(lambda state, pid=plugin_id: self.exec_plugin(pid))
+                card.clicked.connect(lambda pid=plugin_id: self.exec_plugin(pid))
+                self.installed_layout.addWidget(card)
+                self.cards_data.append({
+                    "card_widget": card,
+                    "title": plugin_title,
+                    "author": plugin_author,
+                    "type": "Installed",
+                    "info": dict(),
+                    "id": plugin_id
+                })
+        else:
+            self.cards_data = [data for data in self.cards_data if data["type"] == "Installed"]
+
+        if self.SegmentedWidget.currentRouteKey() == 'Repo':
+            for item in self.get_repo_plugins():
+                card = AppCardRich(
+                    icon=FluentIcon.DOWNLOAD,
+                    title=item["name"],
+                    author=item['author'],
+                    parent=self.scroll_content_repo,
+                    description=item['desc'],
+                    tags=[item['system'], item['version'], utils.hum_convert(item['size'])]
+                )
+                card.openButton.setText(
+                    self.tr("Download") if not module_manager.is_installed(item['id']) else self.tr("Reinstall"))
+                card.openButton.clicked.connect(
+                    lambda state, plugin_info=item: self.download_plugin(plugin_info))
+
+                status = self.download_status.get(item['id'])
+                if status:
+                    state, enable = status
+                    card.openButton.setText(state)
+                    card.openButton.setDisabled(not enable)
+
+                self.repo_layout.addWidget(card)
+                self.cards_data.append({
+                    "card_widget": card,
+                    "title": item["name"],
+                    "author": item["author"],
+                    "type": "Repo",
+                    "info": item,
+                    "id": item['id']
+                })
+                self.repo_cards[item['id']] = card
+
+        self.filter_plugins(self.search_bar.text())
+
+    def set_download_status(self, plugin_info: dict, state: str = "", enable: bool = False):
+        plugin_id = plugin_info['id']
+        self.download_status[plugin_id] = (state, enable)
+        card_widget = self.repo_cards.get(plugin_id)
+        if card_widget is None:
+            return 1
+        card_widget.openButton.setDisabled(not enable)
+        if state:
+            card_widget.openButton.setText(state)
+
+    def load_installed_plugin(self, plugin_id: str):
+        if module_manager.is_installed(plugin_id):
+            module_manager.register_plugin(plugin_id)
+
+    def download_plugin(self, plugin_info: dict):
+        code = utils.v_code(10)
+        self.tasks[code] = GenericTaskWorker(self.__download_plugin, plugin_info)
+        self.tasks[code].task_finished.connect(lambda state, code=code:  self.tasks.pop(code))
+        self.tasks[code].start()
+
+    def __download_plugin(self, plugin_info: dict):
+        result = self._install_repo_plugin(plugin_info, set())
+        if not result:
+            return 1
+
+        events.show_info_bar.emit(
+            self.tr("Success"),
+            self.tr("{} installed successfully.").format(plugin_info.get("name", plugin_info['id'])),
+            3, 5000
+        )
+        events.load_plugin_cards.emit()
+        return None
+
+    def _install_repo_plugin(self, plugin_info: dict, installing: set[str]) -> bool:
+        plugin_id = plugin_info['id']
+        if module_manager.is_installed(plugin_id):
+            return True
+        if plugin_id in installing:
+            events.show_info_bar.emit(
+                self.tr("Warning"),
+                self.tr("Dependency cycle detected while installing {}.").format(plugin_info.get("name", plugin_id)),
+                2, 3500
+            )
+            return False
+
+        installing.add(plugin_id)
+        events.download_signal.emit(plugin_info, self.tr("Downloading..."), False)
+
+        repo_plugins = {item['id']: item for item in self.get_repo_plugins()}
+        for dependency_id in plugin_info.get('depend', []):
+            if module_manager.is_installed(dependency_id):
+                continue
+            dependency_info = repo_plugins.get(dependency_id)
+            if dependency_info is None:
+                events.show_info_bar.emit(
+                    self.tr("Warning"),
+                    self.tr("Dependency {} for {} is not available in the plugin repository.").format(
+                        dependency_id, plugin_info.get("name", plugin_id)),
+                    2, 3500
+                )
+                events.download_signal.emit(plugin_info, self.tr("Retry"), True)
+                installing.remove(plugin_id)
+                return False
+            if not self._install_repo_plugin(dependency_info, installing):
+                events.download_signal.emit(plugin_info, self.tr("Retry"), True)
+                installing.remove(plugin_id)
+                return False
+
+        for file in plugin_info.get("files", []):
+            file_path = os.path.join(temp, file)
+            size = plugin_info.get("size", 0)
+            if not (os.path.exists(file_path) and os.path.getsize(file_path) == size):
+                try:
+                    download_generator = utils.download_api(
+                        cfg.pluginRepo.value + file, temp, size_=size, chunk_size=max(size // 4, 1)
+                    )
+                    for percentage, speed_val, bytes_down, file_size_val, elapsed_val in download_generator:
+                        events.download_signal.emit(plugin_info, f"{percentage} %", False)
+                except Exception as e:
+                    events.show_info_bar.emit(
+                        self.tr("Warning"), self.tr("Failed to download {}, reason: {}").format(file, e), 2, 3500
+                    )
+                    events.download_signal.emit(plugin_info, self.tr("Retry"), True)
+                    installing.remove(plugin_id)
+                    return False
+
+            result, reason = module_manager.install(file_path)
+            if result != module_error_codes.Normal:
+                events.show_info_bar.emit(
+                    self.tr("Warning"),
+                    self.tr("Failed to install {}: {}").format(plugin_info.get("name", plugin_id), reason),
+                    2, 3500
+                )
+                events.download_signal.emit(plugin_info, self.tr("Retry"), True)
+                installing.remove(plugin_id)
+                return False
+            events.plugin_installed.emit(plugin_id)
+
+        installing.remove(plugin_id)
+        self.download_status.pop(plugin_id, None)
+        return True
+
+    def filter_plugins(self, text):
+        """Dynamically filters plugin records aligned exactly with active context view keys"""
+        query = text.strip().lower()
+        current_view_key = self.SegmentedWidget.currentRouteKey()
+
+        for data in self.cards_data:
+            if data["type"] == current_view_key:
+                visible = not query or (query in data["title"] or query in data["author"])
+                data["card_widget"].setVisible(visible)
+            else:
+                data["card_widget"].hide()
+
+    def uninstall_plugin(self, plugin_id: str):
+        UninstallMpk(plugin_id, True, self)
+        self.load_plugin_cards()
+
+    def get_repo_plugins(self, force_update: bool = False):
+        if not os.path.exists(self.local_db_path) or force_update:
+            url_response = requests.get(cfg.pluginRepo.value + 'plugin.json', timeout=10)
+            url_response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx).
+            data = url_response.json()  # Parse JSON response.
+            utils.JsonEdit(self.local_db_path).write(data)
+        else:
+            data = utils.JsonEdit(self.local_db_path).read()
+            if not data:
+                self.get_repo_plugins(force_update=True)
+        return data
+
+    def install_mpk(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, self.tr("Choose a mpk file"), "", "MPK Files (*.mpk)"
+        )
+        if file_path:
+            dialog = InstallMpk(file_path, self)
+            if dialog.exec_():
+                self.load_plugin_cards()
+
+    def exec_plugin(self, plugin_id):
+        module_manager.run(plugin_id)

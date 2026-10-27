@@ -18,20 +18,26 @@ import logging
 import os
 import os.path
 import platform
+import re
+import shutil
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import traceback
+import zipfile
 from difflib import SequenceMatcher
 from enum import IntEnum
 from lzma import LZMADecompressor
-from os import getcwd, cpu_count
+from os import getcwd
 from os.path import exists
 from random import randint, choice
+from shutil import rmtree
 from subprocess import Popen
-from threading import Thread
+
+import requests
 
 from src.core import blockimgdiff
 from src.core import sparse_img
@@ -62,7 +68,10 @@ else:
         if path_frags[-3:] == ['tool.app', 'Contents', 'MacOS']:
             path_frags = path_frags[:-3]
             prog_path = os.path.sep.join(path_frags)
-project_name = None
+
+temp = os.path.join(prog_path, "bin", "temp").replace(os.sep, '/')
+tool_log = f'{temp}/{time.strftime("%Y%m%d_%H-%M-%S", time.localtime())}.log'
+tool_self = os.path.normpath(os.path.abspath(sys.argv[0]))
 # [header, desc, offset (if exist)]
 formats = ([b'PK', "zip"], [b'OPPOENCRYPT!', "ozip"], [b'7z', "7z"], [b'\x53\xef', 'ext', 1080],
            [b'\x3a\xff\x26\xed', "sparse"], [b'\xe2\xe1\xf5\xe0', "erofs", 1024], [b"CrAU", "payload"],
@@ -110,7 +119,7 @@ else:
 tool_bin = os.path.join(prog_path, 'bin', platform.system(), platform.machine()) + os.sep
 
 
-def call(exe, extra_path=True, out: bool = True, env: dict[str, str] | None = None, debug_binary: bool = False):
+def call(exe, extra_path=True, out: bool = True, env: dict[str, str] | None = None):
     def output(inp: subprocess.CalledProcessError | Popen[bytes]):
         for i in iter(inp.stdout.readline, b""):
             try:
@@ -133,12 +142,7 @@ def call(exe, extra_path=True, out: bool = True, env: dict[str, str] | None = No
         if os.name == 'posix':
             cmd = cmd.split()
     conf = subprocess.CREATE_NO_WINDOW if os.name != 'posix' else 0
-    if debug_binary:
-        if os.name == 'nt':
-            strace_path = f"{tool_bin}/strace.exe"
-        else:
-            strace_path = "strace"
-        cmd = [strace_path, *cmd]
+
     try:
         ret = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, creationflags=conf, env=env)
@@ -155,6 +159,12 @@ def call(exe, extra_path=True, out: bool = True, env: dict[str, str] | None = No
     ret.wait()
     logging.debug(f"exit_code : {ret.returncode}")
     return ret.returncode
+
+
+def re_folder(path):
+    if os.path.exists(path):
+        rmtree(path)
+    os.makedirs(path, exist_ok=True)
 
 
 class GuoKeLogo:
@@ -353,10 +363,13 @@ def gettype(file) -> str:
     :param file: file path
     :return:
     """
+
     if not os.path.isfile(file):
         return 'fnf'
     if not os.path.exists(file):
         return "fne"
+    if os.path.getsize(file) < 5:
+        return 'unknown'
 
     def is_super(fil) -> bool:
         with open(fil, 'rb') as file_:
@@ -371,8 +384,8 @@ def gettype(file) -> str:
             return 'super'
     except IndexError:
         ...
-    for header, desc, *offset in formats:
-        with open(file, 'rb') as f:
+    with open(file, 'rb') as f:
+        for header, desc, *offset in formats:
             f.seek(offset[0] if offset else 0)
             if f.read(len(header)) == header:
                 return desc
@@ -477,33 +490,6 @@ def remove_duplicate(file_) -> None:
     del data
 
 
-threads: int = 0
-
-def func_wrapper(func, *args):
-    global threads
-    func(*args)
-    threads -= 1
-def create_thread(func, *args, join=False):
-    """
-    Multithreaded running tasks
-    :param deamon:
-    :param func: Function
-    :param args:Args for the task
-    :param join:if wait the task
-    :return:
-    """
-    global threads
-    if threads >= cpu_count():
-        print(f"Cannot create thread {func.__name__} with {args}")
-        return
-    threads += 1
-    thread = Thread(target=func_wrapper, args=(func, *args), daemon=True)
-    thread.start()
-    if join:
-        thread.join()
-        threads -= 1
-
-
 def simg2img(path: str):
     """
     convert Sparse image to Raw Image
@@ -551,6 +537,71 @@ def findfile(file, dir_) -> str:
     return ''
 
 
+def download_api(url, path=None, int_=True, size_: int = 0, chunk_size: int = 2048576):
+    """
+    return percentage, speed, bytes_downloaded, file_size, elapsed
+    """
+    start_time = time.time()
+    session = requests.Session()  # Create a session once
+
+    try:
+        # HEAD request to get the file size. Verify=True by default.
+        # Add a timeout to prevent hanging
+        response_head = session.head(url, timeout=10)  # 10-second timeout
+        response_head.raise_for_status()  # Check for HTTP errors (4xx, 5xx)
+        file_size = int(response_head.headers.get("Content-Length", 0))
+    except requests.exceptions.RequestException as e_head:
+        logging.error(f"Error making HEAD request to {url}: {e_head}")
+        # In case of a HEAD error, we can either abort or try to download without a known file_size.
+        # Here, we will continue; file_size will remain 0, and if size_ is provided, it will be used.
+        file_size = 0  # or an exception could be raised and handled further up
+
+    # GET request to download the file.
+    # Removed verify=False, so the default True is used.
+    try:
+        # Add a timeout for the GET request as well (for establishing the connection)
+        response_get = session.get(url, stream=True, timeout=10)
+        response_get.raise_for_status()  # Check for HTTP errors
+    except requests.exceptions.RequestException as e_get:
+        raise e_get
+
+    last_time = time.time()
+    if file_size == 0 and size_ > 0:  # Use the provided size_ if not obtained from the header
+        file_size = size_
+    file_save_path = os.path.join(path, os.path.basename(url))
+    logging.info(f"Starting download: {url} to {file_save_path}, expected size: {file_size}")
+
+    with open(file_save_path, "wb") as f:
+        bytes_downloaded = 0
+        for data in response_get.iter_content(chunk_size=chunk_size):
+            if not data:  # Check for empty data if the connection was dropped
+                break
+            f.write(data)
+            bytes_downloaded += len(data)
+
+            current_time = time.time()
+            elapsed_total = current_time - start_time
+
+            # Speed calculation
+            # To avoid division by zero if the time interval is very small
+            time_since_last_chunk = current_time - last_time
+            speed = 0
+            if time_since_last_chunk > 0.001:  # Avoid division by a very small number
+                speed = (len(data) / 1024) / time_since_last_chunk  # Speed of the current chunk
+            else:  # If the time interval is very small, use the average speed
+                if elapsed_total > 0.001:
+                    speed = (bytes_downloaded / 1024) / elapsed_total
+
+            last_time = current_time
+
+            percentage = "Unknown"  # If file_size is unknown
+            if file_size > 0:
+                percentage_float = (bytes_downloaded / file_size) * 100
+                percentage = int(percentage_float) if int_ else percentage_float
+
+            yield percentage, speed, bytes_downloaded, file_size, elapsed_total
+
+
 def findfolder(dir__, folder_name):
     """
     Find Folder
@@ -564,31 +615,6 @@ def findfolder(dir__, folder_name):
                 return os.path.join(root, dirname).replace("\\", '/')
     return None
 
-
-def move_center(master):
-    """
-    Replace Toplevel or Tk to Center
-    :param master: Window
-    :return:
-    """
-    master.geometry(
-        f'+{int(master.winfo_screenwidth() / 2 - master.winfo_width() / 2)}+{int(master.winfo_screenheight() / 2 - master.winfo_height() / 2)}')
-    master.update()
-
-
-# ----CLASSES
-class LangUtils:
-    def __init__(self):
-        self.second = {}
-
-    def __getattr__(self, item):
-        try:
-            return self.__getattribute__(item)
-        except (AttributeError,):
-            return self.second.get(item, 'None')
-
-
-lang = LangUtils()
 
 u64 = lambda x: struct.unpack('>Q', x)[0]
 
@@ -682,6 +708,119 @@ class Bmphead:
 class XiaomiBlkstruct:
     def __init__(self, buf: bytes):
         self.img_offset, self.blksz = struct.unpack("2I", buf)
+
+
+class GetFolderSize:
+    # get-command
+    # 1 - return True value of dir size
+    # 2 - return Rsize value of dir size
+    # 3 - return Rsize value of dir size and modify dynampic_partition_list
+    def __init__(self, dir_: str, num: int = 1, get: int = 2, list_f: str = None):
+        self.rsize_v: int
+        self.num = num
+        self.get = get
+        self.list_f = list_f
+        self.dname = os.path.basename(dir_)
+        self.size = 0
+
+        def get_dir_size(path):
+            for root, _, files in os.walk(path):
+                for name in files:
+                    try:
+                        file_path = os.path.join(root, name)
+                        if not os.path.isfile(file_path):
+                            self.size += len(name)
+                        if os.path.exists(file_path):
+                            self.size += os.path.getsize(file_path)
+                    except (PermissionError, BaseException, Exception, FileNotFoundError):
+                        logging.exception(f"Getsize {name}")
+                        self.size += 1
+            self.size += (self.size / 16384) * 256
+            if self.size > 100 * 1024 * 1024:
+                self.size += 16 * (1024 ** 2)
+
+        get_dir_size(dir_)
+        if self.get == 1:
+            self.rsize_v = self.size
+        else:
+            self.rsize(self.size, self.num)
+
+    def rsize(self, size: int, num: int):
+        if size <= 2097152:
+            self.rsize_v = 2097152
+        elif size <= 1048576:
+            self.rsize_v = 1048576
+        else:
+            size_ = int(size)
+            if size_ % 4096:
+                size_ = size_ + (4096 - size_ % 4096)
+            self.rsize_v = size_
+        if self.get == 3:
+            self.rsizelist(self.dname, self.rsize_v, self.list_f)
+        self.rsize_v = int(self.rsize_v / num)
+
+    @staticmethod
+    def rsizelist(part_name, size, file):
+        if os.access(file, os.F_OK):
+            print("将 %s 大小调整为 %s" % (part_name, size))
+            with open(file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            with open(file, 'w', encoding='utf-8', newline='\n') as ff:
+                content = re.sub(f"resize {part_name} \\d+",
+                                 f"resize {part_name} {size}", content)
+                content = re.sub(f"resize {part_name}_a \\d+",
+                                 f"resize {part_name}_a {size}", content)
+                content = re.sub(f"# Grow partition {part_name} from 0 to \\d+",
+                                 f"# Grow partition {part_name} from 0 to {size}",
+                                 content)
+                content = re.sub(f"# Grow partition {part_name}_a from 0 to \\d+",
+                                 f"# Grow partition {part_name}_a from 0 to {size}", content)
+                ff.write(content)
+
+
+def pack_zip(input_dir: str, output_zip: str):
+    with zipfile.ZipFile(output_zip, 'w',
+                         compression=zipfile.ZIP_DEFLATED) as zip_:
+        for file in get_all_file_paths(input_dir):
+            file = str(file)
+            arch_name = file.replace(input_dir, '')
+            print(f"adding: {arch_name}")
+            try:
+                zip_.write(file, arcname=arch_name)
+            except Exception as e:
+                print("写入 {} 时出现错误 ：{}".format(file, e))
+    if os.path.exists(output_zip):
+        print("打包 {} 成功！".format(output_zip))
+
+
+def generate_bug_report():
+    output = prog_path
+    output = str(output)
+    if not output:
+        return
+    if not os.path.isdir(output) or not os.path.exists(output):
+        return
+    re_folder(inner := os.path.join(temp, v_code()))
+    shutil.copyfile(tool_log, os.path.join(inner, os.path.basename(tool_log)))
+    with open(os.path.join(inner, 'detail.txt'), 'w+', encoding='utf-8', newline='\n') as f:
+
+        f.write(f"""
+        ----BasicInfo-----
+        Python: {sys.version}
+        Platform: {sys.platform}
+        Exec Command: {sys.argv}
+        Tool Version: qt
+        Source code running: {states.run_source}
+        python Implementation: {platform.python_implementation()}
+        Uname: {platform.uname()}
+        ----Settings-------
+        """)
+        with open(os.path.join(prog_path, 'bin', "settings.json"), 'r', encoding='utf-8') as f2:
+            f.write(f2.read())
+    pack_zip(inner, bugreport := os.path.join(output,
+                                              f"Mio_Bug_Report{time.strftime('%Y%m%d_%H-%M-%S', time.localtime())}_{v_code()}.zip"))
+    re_folder(inner)
+    print(f"\tThe Bug Report Was Saved:{bugreport}")
 
 
 class LogoDumper:
@@ -832,7 +971,7 @@ class MkcSuggest:
 
     def get(self, language: str, prompt: str):
         similarity = 0
-        text = lang.no_idea.format(prompt)
+        text = f"No idea about: {prompt}"
         detail = 'Unknown'
         if prompt:
             for i in self.library.keys():
