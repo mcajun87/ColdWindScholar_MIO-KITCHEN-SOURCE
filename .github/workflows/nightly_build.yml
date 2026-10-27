@@ -1,4 +1,4 @@
-name: "Build Tool Nightly (Android 17 & All Platforms)"
+name: "Build Tool Nightly"
 permissions:
   contents: write
   discussions: write
@@ -9,7 +9,6 @@ on:
     paths:
       - "bin/update.json"
   workflow_dispatch:
-
 jobs:
   build:
     needs: [build-win, build-linux, build-macos, build-android]
@@ -20,15 +19,20 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
-          sudo apt update && sudo apt install -y git erofs-utils android-sdk-libsparse-utils
+          sudo apt install git erofs-utils android-sdk-libsparse-utils -y
       - name: Generate Release Content
         run: |
           python3 build.py grb || true
           python3 build.py ma || true
+          if [ ! -f "body.md" ] || grep -q "Create sync.yml" "body.md"; then
+            echo "### 🌙 MIO-KITCHEN Nightly (Android 17)" > body.md
+            echo "" >> body.md
+            git log -n 5 --pretty=format:"- %s (%an)" >> body.md
+          fi
       - name: Upload release
         uses: ncipollo/release-action@v1
         with:
@@ -36,8 +40,8 @@ jobs:
           prerelease: true
           omitBodyDuringUpdate: true
           removeArtifacts: true
-          name: "MIO-KITCHEN-Nightly (Android 17 & Universal)"
-          tag: "CI_BUILD_${{ github.run_number }}"
+          name: "MIO-KITCHEN-Nightly (Android 17)"
+          tag: "CI_NIGHTLY_${{ github.run_number }}"
           bodyFile: "body.md"
           artifacts: "*.zip"
 
@@ -45,15 +49,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
+      - name: Set up Python 3.14
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
           architecture: 'x64'
-      - name: Update pip and dependencies
-        run: |
-          python -m pip install -U --force-reinstall pip requests
-      - name: Pack tool for Windows
+      - name: Update pip
+        run: python -m pip install -U --force-reinstall pip requests
+      - name: Pack tool
         env:
           TARGET_ANDROID: "17"
         run: python build.py
@@ -61,7 +64,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: MIO-KITCHEN-win-android17
+          name: MIO-KITCHEN-win-nightly
           path: './MIO-KITCHEN-win.zip'
 
   build-linux:
@@ -72,7 +75,7 @@ jobs:
             runner: ubuntu-latest
             arch_suffix: amd64
           - arch: arm64
-            runner: ubuntu-22.04
+            runner: ubuntu-26.04-arm
             arch_suffix: arm64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -80,21 +83,20 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
-          sudo apt update && sudo apt install -y liblzo2-dev erofs-utils
-      - name: Pack Tool for Linux
-        env:
-          TARGET_ANDROID: "17"
-        run: python3 build.py
+          sudo apt install liblzo2-dev erofs-utils -y
+      - name: Rename Artifact to Avoid Overwrite
+        run: |
+          mv MIO-KITCHEN-linux.zip MIO-KITCHEN-linux-${{ matrix.arch_suffix }}.zip
       - name: Upload Linux Build
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: MIO-KITCHEN-linux-${{ matrix.arch_suffix }}-android17
-          path: './MIO-KITCHEN-linux.zip'
+          name: MIO-KITCHEN-linux-${{ matrix.arch_suffix }}-nightly
+          path: './MIO-KITCHEN-linux-${{ matrix.arch_suffix }}.zip'
 
   build-macos:
     strategy:
@@ -102,7 +104,7 @@ jobs:
         include:
           - os: macos-latest
             suffix: arm64
-          - os: macos-13
+          - os: macos-26-intel
             suffix: intel
     runs-on: ${{ matrix.os }}
     steps:
@@ -110,20 +112,29 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
-      - name: Pack Tool for macOS
+      - name: Pack Tool
         env:
           TARGET_ANDROID: "17"
         run: python3 build.py
-      - name: Upload Macos Build
-        if: success()
+      - name: Rename Artifact to Avoid Overwrite
+        run: |
+          mv MIO-KITCHEN-macos.zip MIO-KITCHEN-macos-${{ matrix.suffix }}.zip
+      - name: Upload Arm64 Macos Build
+        if: success() && matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: MIO-KITCHEN-macos-${{ matrix.suffix }}-android17
-          path: './MIO-KITCHEN-macos.zip'
+          name: MIO-KITCHEN-macos-nightly
+          path: './MIO-KITCHEN-macos-arm64.zip'
+      - name: Upload x86_64 Macos Build
+        if: success() && matrix.os == 'macos-26-intel'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIO-KITCHEN-macos-intel-nightly
+          path: './MIO-KITCHEN-macos-intel.zip'
 
   build-android:
     runs-on: ubuntu-latest
@@ -132,12 +143,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
           sudo apt update && sudo apt install -y erofs-utils android-sdk-libsparse-utils
-      - name: Pack Tool for Android (Termux / ARM64 Native)
+      - name: Pack Tool for Android (Termux Native)
         env:
           TARGET_ANDROID: "17"
           PLATFORM_TARGET: "android"
@@ -147,5 +158,5 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: MIO-KITCHEN-android-arm64-android17
+          name: MIO-KITCHEN-android-nightly
           path: './MIO-KITCHEN-android.zip'
