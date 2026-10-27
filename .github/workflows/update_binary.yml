@@ -1,35 +1,32 @@
-name: "Update Binary (Android 17 Support)"
-
+name: "Update Binary"
 permissions:
   contents: write
   discussions: write
-
 on:
   schedule:
-    - cron: '0 21 * * *' # 每天定时运行
+    - cron: '0 21 * * *'
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
+      - name: Set up Python 3.14
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      - name: Install dependencies
+            python-version: '3.14'
+      - name: Install Dependencies
         run: |
           python3 -m pip install --upgrade pip
           pip install requests
-      - name: Update Android 17 Binary Tools
+      - name: Update
         env:
-          ANDROID_VERSION: "17"
+          TARGET_ANDROID: "17"
         run: |
           python3 ./config upbin || python3 ./config upbin --target-android 17
           git config --local user.email "3590361911@qq.com"
           git config --local user.name "ColdWindScholar"
           git remote set-url origin https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
           git add bin
-          git commit --allow-empty -m "Update binary tools for Android 17 compatibility"
+          git commit --allow-empty -m "Update binary for Android 17"
           git push
