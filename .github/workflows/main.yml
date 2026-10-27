@@ -7,6 +7,7 @@ on:
     paths:
       - "bin/update.json"
   workflow_dispatch:
+
 jobs:
   build:
     needs: [build-win, build-linux, build-macos, build-android]
@@ -17,7 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.11'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
@@ -26,8 +27,9 @@ jobs:
         run: |
           python3 build.py grb || true
           python3 build.py ma || true
+          # 自动拦截并修正错误的 sync.yml 提交日志
           if [ ! -f "body.md" ] || grep -q "Create sync.yml" "body.md"; then
-            echo "### 🚀 MIO-KITCHEN Changelog (Android 17 & All Platforms)" > body.md
+            echo "### 🚀 MIO-KITCHEN 更新日志 (Changelog)" > body.md
             echo "" >> body.md
             git log -n 5 --pretty=format:"- %s (%an)" >> body.md
           fi
@@ -37,8 +39,8 @@ jobs:
           allowUpdates: true
           omitBodyDuringUpdate: true
           removeArtifacts: true
-          name: "MIO-KITCHEN Universal Release (Android 17)"
-          tag: "CI_BUILD_${{ github.run_number }}"
+          name: "MIO-KITCHEN Release (Android 17)"
+          tag: "v4.2.1-build${{ github.run_number }}"
           bodyFile: "body.md"
           artifacts: "*.zip"
 
@@ -46,12 +48,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           architecture: 'x64'
-      - name: Update pip
+      - name: Update pip and dependencies
         run: python -m pip install -U --force-reinstall pip requests
       - name: Pack tool
         env:
@@ -62,7 +64,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MIO-KITCHEN-win
-          path: './MIO-KITCHEN-win.zip'
+          path: './*.zip'
 
   build-linux:
     strategy:
@@ -89,9 +91,12 @@ jobs:
         env:
           TARGET_ANDROID: "17"
         run: python3 build.py
-      - name: Rename Artifact to Avoid Overwrite
+      - name: Rename Artifact Safely
         run: |
-          mv MIO-KITCHEN-linux.zip MIO-KITCHEN-linux-${{ matrix.arch_suffix }}.zip
+          zip_files=(MIO-KITCHEN*.zip)
+          if [ -f "${zip_files[0]}" ]; then
+            mv "${zip_files[0]}" "MIO-KITCHEN-linux-${{ matrix.arch_suffix }}.zip"
+          fi
       - name: Upload Linux Build
         if: success()
         uses: actions/upload-artifact@v4
@@ -121,21 +126,18 @@ jobs:
         env:
           TARGET_ANDROID: "17"
         run: python3 build.py
-      - name: Rename Artifact to Avoid Overwrite
+      - name: Rename Artifact Safely
         run: |
-          mv MIO-KITCHEN-macos.zip MIO-KITCHEN-macos-${{ matrix.suffix }}.zip
-      - name: Upload Arm64 Macos Build
-        if: success() && matrix.os == 'macos-latest'
+          zip_files=(MIO-KITCHEN*.zip)
+          if [ -f "${zip_files[0]}" ]; then
+            mv "${zip_files[0]}" "MIO-KITCHEN-macos-${{ matrix.suffix }}.zip"
+          fi
+      - name: Upload Macos Build
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: MIO-KITCHEN-macos
-          path: './MIO-KITCHEN-macos-arm64.zip'
-      - name: Upload x86_64 Macos Build
-        if: success() && matrix.os == 'macos-26-intel'
-        uses: actions/upload-artifact@v4
-        with:
-          name: MIO-KITCHEN-macos-intel
-          path: './MIO-KITCHEN-macos-intel.zip'
+          name: MIO-KITCHEN-macos-${{ matrix.suffix }}
+          path: './MIO-KITCHEN-macos-${{ matrix.suffix }}.zip'
 
   build-android:
     runs-on: ubuntu-latest
@@ -144,12 +146,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.11'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
           sudo apt update && sudo apt install -y erofs-utils android-sdk-libsparse-utils
-      - name: Pack Tool for Android (Termux Native)
+      - name: Pack Tool for Android (Termux / ARM64 Native)
         env:
           TARGET_ANDROID: "17"
           PLATFORM_TARGET: "android"
@@ -160,4 +162,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MIO-KITCHEN-android-arm64
-          path: './MIO-KITCHEN-android.zip'
+          path: './*.zip'
