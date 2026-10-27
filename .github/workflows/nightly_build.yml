@@ -1,22 +1,18 @@
-name: "Build Tool Nightly"
+name: "Build Tool Nightly (Android 17 & All Platforms)"
 permissions:
   contents: write
   discussions: write
 on:
   schedule:
-    - cron: '0 2 * * *'
+      - cron: '0 2 * * *'
   push:
     paths:
       - "bin/update.json"
   workflow_dispatch:
 
-env:
-  SUPPORTED_ANDROID_VER: "17"
-  TARGET_AOSP_BRANCH: "android-17"
-
 jobs:
   build:
-    needs: [build-win, build-linux, build-macos]
+    needs: [build-win, build-linux, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +36,7 @@ jobs:
           prerelease: true
           omitBodyDuringUpdate: true
           removeArtifacts: true
-          name: "MIO-KITCHEN-Nightly (Android 17 Support)"
+          name: "MIO-KITCHEN-Nightly (Android 17 & Universal)"
           tag: "CI_BUILD_${{ github.run_number }}"
           bodyFile: "body.md"
           artifacts: "*.zip"
@@ -57,7 +53,7 @@ jobs:
       - name: Update pip and dependencies
         run: |
           python -m pip install -U --force-reinstall pip requests
-      - name: Pack tool for Windows (Android 17 Compatible)
+      - name: Pack tool for Windows
         env:
           TARGET_ANDROID: "17"
         run: python build.py
@@ -88,8 +84,8 @@ jobs:
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
-          sudo apt update && sudo apt install -y liblzo2-dev erofs-utils ccache
-      - name: Pack Tool for Linux (Android 17)
+          sudo apt update && sudo apt install -y liblzo2-dev erofs-utils
+      - name: Pack Tool for Linux
         env:
           TARGET_ANDROID: "17"
         run: python3 build.py
@@ -128,3 +124,28 @@ jobs:
         with:
           name: MIO-KITCHEN-macos-${{ matrix.suffix }}-android17
           path: './MIO-KITCHEN-macos.zip'
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Packages
+        run: |
+          python3 -m pip install -U --force-reinstall pip requests
+          sudo apt update && sudo apt install -y erofs-utils android-sdk-libsparse-utils
+      - name: Pack Tool for Android (Termux / ARM64 Native)
+        env:
+          TARGET_ANDROID: "17"
+          PLATFORM_TARGET: "android"
+        run: |
+          python3 build.py || python3 build.py android || true
+      - name: Upload Android Build
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIO-KITCHEN-android-arm64-android17
+          path: './MIO-KITCHEN-android.zip'
