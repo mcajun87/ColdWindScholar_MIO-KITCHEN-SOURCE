@@ -66,7 +66,6 @@ jobs:
           bodyFile: "body.md"
           artifacts: "./artifacts/*.zip"
 
-  # ================== Windows 构建 ==================
   build-win:
     runs-on: windows-latest
     steps:
@@ -76,19 +75,25 @@ jobs:
         with:
           python-version: '3.11'
           architecture: 'x64'
-      - name: Update pip
-        run: python -m pip install -U --force-reinstall pip requests
+      - name: Update pip and dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install -U requests
+          python -m pip install pyinstaller pywin32 pywin32-ctypes
+          python -m pywin32_postinstall -install
       - name: Pack tool
         env:
           TARGET_ANDROID: "17"
-        run: python build.py
+          PYTHONPATH: "C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages;C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages\\win32;C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages\\win32\\lib"
+        run: |
+          python -c "import pywin32_system32, shutil, os; [shutil.copy(os.path.join(pywin32_system32.__path__[0], f), '.') for f in os.listdir(pywin32_system32.__path__[0]) if f.endswith('.dll')]"
+          python build.py
       - name: Upload Win Build
         uses: actions/upload-artifact@v4
         with:
           name: MIO-KITCHEN-win-nightly
           path: './*.zip'
 
-  # ================== Linux 构建 ==================
   build-linux:
     strategy:
       fail-fast: false
@@ -127,7 +132,6 @@ jobs:
           name: MIO-KITCHEN-linux-${{ matrix.arch_suffix }}-nightly
           path: './MIO-KITCHEN-linux-${{ matrix.arch_suffix }}-nightly.zip'
 
-  # ================== macOS 构建 ==================
   build-macos:
     strategy:
       fail-fast: false
@@ -163,7 +167,6 @@ jobs:
           name: MIO-KITCHEN-macos-${{ matrix.suffix }}-nightly
           path: './MIO-KITCHEN-macos-${{ matrix.suffix }}-nightly.zip'
 
-  # ================== Android 构建 ==================
   build-android:
     runs-on: ubuntu-latest
     steps:
