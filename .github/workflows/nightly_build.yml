@@ -5,23 +5,27 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天凌晨 2 点运行
+    - cron: '0 2 * * *'
   push:
     paths:
       - "bin/update.json"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '是否发布到 Release？'
+        required: true
+        type: boolean
+        default: true
 
 jobs:
-  # ================== 主发布任务 ==================
   build:
-    # 注意：如果某个平台构建失败，加上 always() 可以让主 Job 依然尝试发布成功的平台
     if: always()
     needs: [build-win, build-linux, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 5 # 为了下面生成日志用
+          fetch-depth: 5
           
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
@@ -50,6 +54,7 @@ jobs:
           fi
           
       - name: Upload release
+        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event.inputs.publish_release == 'true'
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
@@ -93,7 +98,7 @@ jobs:
             runner: ubuntu-latest
             arch_suffix: amd64
           - arch: arm64
-            runner: ubuntu-latest # 修正：原 ubuntu-26.04-arm 不存在
+            runner: ubuntu-latest
             arch_suffix: arm64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -101,7 +106,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # 修正：原 3.14 不存在
+          python-version: '3.11'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
@@ -130,7 +135,7 @@ jobs:
         include:
           - os: macos-latest
             suffix: arm64
-          - os: macos-13 # 修正：原 macos-26-intel 不存在
+          - os: macos-13
             suffix: intel
     runs-on: ${{ matrix.os }}
     steps:
@@ -138,7 +143,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # 修正：统一版本避免不兼容
+          python-version: '3.11'
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
