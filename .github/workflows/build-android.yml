@@ -1,0 +1,65 @@
+name: "Build Android (Termux ARM64)"
+permissions:
+  contents: write
+  discussions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '是否发布到 Release？'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build-android-arm:
+    # 核心：使用原生的 ARM64 Linux 环境，生成手机 Termux 可用的包
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install Packages
+        run: |
+          python3 -m pip install -U pip requests
+          sudo apt update && sudo apt install -y erofs-utils android-sdk-libsparse-utils zip
+          
+      - name: Pack Tool for Android
+        env:
+          TARGET_ANDROID: "17"
+          PLATFORM_TARGET: "android"
+        # 如果你的 build.py 支持直接打 android 包就用 android 参数，否则用默认执行
+        run: |
+          python3 build.py android || python3 build.py
+          
+      - name: Rename Artifact Safely
+        run: |
+          zip_files=(MIO-KITCHEN*.zip)
+          if [ -f "${zip_files[0]}" ]; then
+            mv "${zip_files[0]}" "MIO-KITCHEN-android-arm64.zip"
+          else
+            echo "警告：未找到 zip 文件"
+            exit 1
+          fi
+          
+      - name: Upload Android Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIO-KITCHEN-android-arm64
+          path: './MIO-KITCHEN-android-arm64.zip'
+
+      - name: Publish Release (Android)
+        if: github.event.inputs.publish_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MIO-KITCHEN Android (Termux) Build
+          tag_name: "android-build-${{ github.run_number }}"
+          files: './MIO-KITCHEN-android-arm64.zip'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
