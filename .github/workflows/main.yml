@@ -10,13 +10,16 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: '是否发布到 Release？'
+        description: '是否发布到 Release？(如果只测试，请取消勾选)'
         required: true
         type: boolean
         default: true
 
 jobs:
+  # ================== 主发布任务 ==================
   build:
+    # 加上 always() 确保某个平台失败时，其他成功的产物依然能发布
+    if: always()
     needs: [build-win, build-linux, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
@@ -49,7 +52,6 @@ jobs:
           fi
           
       - name: Upload release
-        # 如果是手动触发，检查开关；如果是 push 自动触发，则默认发布
         if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
         uses: ncipollo/release-action@v1
         with:
@@ -72,7 +74,10 @@ jobs:
           python-version: '3.11'
           architecture: 'x64'
       - name: Update pip and dependencies
-        run: python -m pip install -U pip requests
+        run: |
+          python -m pip install -U pip requests
+          # 关键修复：安装兼容的 PyInstaller 版本，避免 pythoncom 报错
+          python -m pip install "pyinstaller==5.13.2"
       - name: Pack tool
         env:
           TARGET_ANDROID: "17"
