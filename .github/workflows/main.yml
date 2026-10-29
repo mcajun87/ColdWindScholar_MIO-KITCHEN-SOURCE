@@ -1,4 +1,4 @@
-name: "Build Tool"
+name: "构建Build Tool"
 permissions:
   contents: write
   discussions: write
@@ -75,16 +75,12 @@ jobs:
           python -m pip install --upgrade pip wheel setuptools
           python -m pip install -U requests
           python -m pip install pyinstaller pywin32 pywin32-ctypes
-          # 关键修复：执行注册脚本
-          python -m pywin32_postinstall -install
+          # 修复：使用完整路径执行 postinstall 脚本
+          python Scripts/pywin32_postinstall.py -install
       - name: Pack tool
         env:
           TARGET_ANDROID: "17"
-          PYTHONPATH: "C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages;C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages\\win32;C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages\\win32\\lib"
-        run: |
-          # 关键修复：强行把缺失的 dll 复制到当前目录
-          python -c "import pywin32_system32, shutil, os; [shutil.copy(os.path.join(pywin32_system32.__path__[0], f), '.') for f in os.listdir(pywin32_system32.__path__[0]) if f.endswith('.dll')]"
-          python build.py
+        run: python build.py
       - name: Upload Win Build
         uses: actions/upload-artifact@v4
         with:
