@@ -10,15 +10,13 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: '是否发布到 Release？(如果只测试，请取消勾选)'
+        description: '是否发布到 Release？'
         required: true
         type: boolean
         default: true
 
 jobs:
-  # ================== 主发布任务 ==================
   build:
-    # 加上 always() 确保某个平台失败时，其他成功的产物依然能发布
     if: always()
     needs: [build-win, build-linux, build-macos, build-android]
     runs-on: ubuntu-latest
@@ -63,7 +61,6 @@ jobs:
           bodyFile: "body.md"
           artifacts: "./artifacts/*.zip"
 
-  # ================== Windows 构建 ==================
   build-win:
     runs-on: windows-latest
     steps:
@@ -75,20 +72,25 @@ jobs:
           architecture: 'x64'
       - name: Update pip and dependencies
         run: |
-          python -m pip install -U pip requests
-          # 关键修复：安装兼容的 PyInstaller 版本，避免 pythoncom 报错
-          python -m pip install "pyinstaller==5.13.2"
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install -U requests
+          python -m pip install pyinstaller pywin32 pywin32-ctypes
+          # 关键修复：执行注册脚本
+          python -m pywin32_postinstall -install
       - name: Pack tool
         env:
           TARGET_ANDROID: "17"
-        run: python build.py
+          PYTHONPATH: "C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages;C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages\\win32;C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\Lib\\site-packages\\win32\\lib"
+        run: |
+          # 关键修复：强行把缺失的 dll 复制到当前目录
+          python -c "import pywin32_system32, shutil, os; [shutil.copy(os.path.join(pywin32_system32.__path__[0], f), '.') for f in os.listdir(pywin32_system32.__path__[0]) if f.endswith('.dll')]"
+          python build.py
       - name: Upload Win Build
         uses: actions/upload-artifact@v4
         with:
           name: MIO-KITCHEN-win
           path: './*.zip'
 
-  # ================== Linux 构建 ==================
   build-linux:
     strategy:
       fail-fast: false
@@ -127,7 +129,6 @@ jobs:
           name: MIO-KITCHEN-linux-${{ matrix.arch_suffix }}
           path: './MIO-KITCHEN-linux-${{ matrix.arch_suffix }}.zip'
 
-  # ================== macOS 构建 ==================
   build-macos:
     strategy:
       fail-fast: false
@@ -162,7 +163,6 @@ jobs:
           name: MIO-KITCHEN-macos-${{ matrix.suffix }}
           path: './MIO-KITCHEN-macos-${{ matrix.suffix }}.zip'
 
-  # ================== Android 构建 ==================
   build-android:
     runs-on: ubuntu-latest
     steps:
