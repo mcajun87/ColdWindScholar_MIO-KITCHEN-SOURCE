@@ -2,29 +2,43 @@ name: "Build Tool Nightly"
 permissions:
   contents: write
   discussions: write
+
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 2 * * *' # 每天凌晨 2 点运行
   push:
     paths:
       - "bin/update.json"
   workflow_dispatch:
 
 jobs:
+  # ================== 主发布任务 ==================
   build:
+    # 注意：如果某个平台构建失败，加上 always() 可以让主 Job 依然尝试发布成功的平台
+    if: always()
     needs: [build-win, build-linux, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+        with:
+          fetch-depth: 5 # 为了下面生成日志用
+          
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+          
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
           sudo apt install git erofs-utils android-sdk-libsparse-utils -y
+          
       - name: Generate Release Content
         run: |
           python3 build.py grb || true
@@ -34,6 +48,7 @@ jobs:
             echo "" >> body.md
             git log -n 5 --pretty=format:"- %s (%an)" >> body.md
           fi
+          
       - name: Upload release
         uses: ncipollo/release-action@v1
         with:
@@ -44,8 +59,9 @@ jobs:
           name: "MIO-KITCHEN Nightly (Android 17)"
           tag: "nightly-build${{ github.run_number }}"
           bodyFile: "body.md"
-          artifacts: "*.zip"
+          artifacts: "./artifacts/*.zip"
 
+  # ================== Windows 构建 ==================
   build-win:
     runs-on: windows-latest
     steps:
@@ -62,21 +78,22 @@ jobs:
           TARGET_ANDROID: "17"
         run: python build.py
       - name: Upload Win Build
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MIO-KITCHEN-win-nightly
           path: './*.zip'
 
+  # ================== Linux 构建 ==================
   build-linux:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-latest
             arch_suffix: amd64
           - arch: arm64
-            runner: ubuntu-26.04-arm
+            runner: ubuntu-latest # 修正：原 ubuntu-26.04-arm 不存在
             arch_suffix: arm64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -84,7 +101,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: '3.11' # 修正：原 3.14 不存在
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
@@ -100,19 +117,20 @@ jobs:
             mv "${zip_files[0]}" "MIO-KITCHEN-linux-${{ matrix.arch_suffix }}-nightly.zip"
           fi
       - name: Upload Linux Build
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MIO-KITCHEN-linux-${{ matrix.arch_suffix }}-nightly
           path: './MIO-KITCHEN-linux-${{ matrix.arch_suffix }}-nightly.zip'
 
+  # ================== macOS 构建 ==================
   build-macos:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
             suffix: arm64
-          - os: macos-26-intel
+          - os: macos-13 # 修正：原 macos-26-intel 不存在
             suffix: intel
     runs-on: ${{ matrix.os }}
     steps:
@@ -120,7 +138,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.11' # 修正：统一版本避免不兼容
       - name: Install Packages
         run: |
           python3 -m pip install -U --force-reinstall pip requests
@@ -135,12 +153,12 @@ jobs:
             mv "${zip_files[0]}" "MIO-KITCHEN-macos-${{ matrix.suffix }}-nightly.zip"
           fi
       - name: Upload Macos Build
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MIO-KITCHEN-macos-${{ matrix.suffix }}-nightly
           path: './MIO-KITCHEN-macos-${{ matrix.suffix }}-nightly.zip'
 
+  # ================== Android 构建 ==================
   build-android:
     runs-on: ubuntu-latest
     steps:
@@ -159,9 +177,14 @@ jobs:
           PLATFORM_TARGET: "android"
         run: |
           python3 build.py || python3 build.py android || true
+      - name: Rename Artifact Safely
+        run: |
+          zip_files=(MIO-KITCHEN*.zip)
+          if [ -f "${zip_files[0]}" ]; then
+            mv "${zip_files[0]}" "MIO-KITCHEN-android-arm64-nightly.zip"
+          fi
       - name: Upload Android Build
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: MIO-KITCHEN-android-nightly
-          path: './*.zip'
+          name: MIO-KITCHEN-android-arm64-nightly
+          path: './MIO-KITCHEN-android-arm64-nightly.zip'
