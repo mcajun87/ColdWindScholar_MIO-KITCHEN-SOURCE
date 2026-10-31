@@ -76,9 +76,8 @@ context_rule_file = os.path.join(cfg.workingFolder.value, 'bin', "context_rules.
 class StreamToSignal(QObject):
     text_written = Signal(str)
 
-    def __init__(self, original_stream):
+    def __init__(self):
         super().__init__()
-        self.original_stream = original_stream
 
     def write(self, text):
         if not text.strip():
@@ -87,14 +86,14 @@ class StreamToSignal(QObject):
         self.text_written.emit(text)
 
     def flush(self):
-        self.original_stream.flush()
-
+        pass
 
 class Events(QObject):
     refresh_projects = Signal()
     refresh_list = Signal()
     set_project_name = Signal(str)
     show_info_bar = Signal(str, str, int, int)
+    append_log = Signal(str, str)
 
 
 events = Events()
@@ -611,6 +610,7 @@ class ProjectsPage(QFrame):
         scroll_content = QWidget()
         self.scroll_log_content = LogMessageBoxBase(self)
         self.scroll_layout = QVBoxLayout(scroll_content)
+        events.append_log.connect(self.scroll_log_content.append_log)
 
         # 【关键优化：增加顶部与四周间距】把原本紧凑的区域整体下调，留出透气的空间
         self.scroll_layout.setContentsMargins(32, 40, 32, 32)
@@ -739,7 +739,7 @@ class ProjectsPage(QFrame):
             try:
                 os.remove(decrypted)
             except:
-                print(f"{ifile} remove Fail!!!")
+                events.append_log.emit("WARN", f"{ifile} remove Fail!!!")
             return
         # tar
         if ftype == 'tar':
@@ -816,7 +816,7 @@ class ProjectsPage(QFrame):
                         try:
                             fz.extract(fi, utils.temp)
                         except Exception as e:
-                            print("cannot rename %s %s" % (fi, e))
+                            events.append_log.emit("ERROR", "cannot rename %s %s" % (fi, e))
                     self.unpackrom(os.path.join(utils.temp, fi))
                     os.remove(os.path.join(utils.temp, fi))
                     return
@@ -835,7 +835,7 @@ class ProjectsPage(QFrame):
                             os.rename(os.path.join(project_manger.current_work_path(), fi),
                                       os.path.join(project_manger.current_work_path(), member_name))
                     except Exception as e:
-                        print("cannot rename %s %s" % (member_name, e))
+                        events.append_log.emit("ERROR", "cannot rename %s %s" % (member_name, e))
                 print("unzip done")
                 self.script2fs(project_manger.current_work_path())
             events.refresh_projects.emit()
@@ -888,7 +888,7 @@ class ProjectsPage(QFrame):
         name = os.path.basename(dir_path)
         print("Copying ", name)
         if not os.path.exists(dir_path):
-            print(self.tr('No Such Folder.'))
+            events.append_log.emit("WARN", self.tr('No Such Folder.'))
             return 1
         if os.path.isfile(dir_path):
             return self.unpackrom(dir_path)
@@ -909,7 +909,7 @@ class ProjectsPage(QFrame):
     def pack_dtbo(self) -> bool:
         work = project_manger.current_work_path()
         if not os.path.exists(f"{work}/dtbo/dts") or not os.path.exists(f"{work}/dtbo"):
-            print("no source find")
+            events.append_log.emit("WARN", "no DTBO source find")
             return False
         utils.re_folder(f"{work}/dtbo/dtbo")
         for dts in os.listdir(f"{work}/dtbo/dts"):
@@ -945,7 +945,7 @@ class ProjectsPage(QFrame):
                 elif os.path.isdir(fi):
                     self.dnd_task = GenericTaskWorker(self.copy_project, fi)
             else:
-                print(self.tr("file not exist"))
+                events.append_log.emit("WARN", self.tr("file not exist"))
             if not self.dnd_task:
                 return
             self.start_job(self.dnd_task)
@@ -1393,7 +1393,7 @@ class ProjectsPage(QFrame):
                                 except (IOError, PermissionError, FileNotFoundError):
                                     logging.exception('Bugs')
                         else:
-                            print("transferpath is not exists")
+                            events.append_log.emit("WARN", "transferpath is not exists")
                     if os.path.exists(f'{work}/{basename}.img'):
                         utils.img2simg(f'{work}/{basename}.img')
                 if src_format == 'raw':
@@ -1429,7 +1429,7 @@ class ProjectsPage(QFrame):
                                 except (PermissionError, IOError, FileNotFoundError, IsADirectoryError):
                                     logging.exception('Bugs')
                         else:
-                            print(f"transferfile of {basename} is not exists.")
+                            events.append_log.emit("WARN", f"transferfile of {basename} is not exists.")
                 if src_format == 'sparse':
                     utils.simg2img(f'{work}/{i}')
             elif dst_format == 'dat':
@@ -1613,7 +1613,7 @@ class ProjectsPage(QFrame):
             origin_logo = utils.findfile('logo.img', work)
         logo = f"{work}/logo-new.img"
         if not os.path.exists(dir_ := f"{work}/logo") or not os.path.exists(origin_logo):
-            print(self.tr("origin logo missing"))
+            events.append_log.emit("WARN", self.tr("origin logo missing"))
             return 1
         utils.LogoDumper(origin_logo, logo, dir_).repack()
         os.remove(origin_logo)
@@ -1680,7 +1680,7 @@ class ProjectsPage(QFrame):
         try:
             repaired = repair_erofs_symlinks(os.path.join(work, name))
         except (OSError, ValueError) as error:
-            print(f'[erofs] Cannot repack {name}: {error}', flush=True)
+            events.append_log.emit("ERROR", f'[erofs] Cannot repack {name}: {error}')
             return 1
         if repaired:
             print(f'[erofs] Restored {repaired} Windows symlink markers in {name}', flush=True)
@@ -1697,7 +1697,7 @@ class ProjectsPage(QFrame):
     def make_ext4fs(self, name: str, work: str, work_output, sparse: bool = False, size: int = 0, UTC: int = None,
                     has_contexts: bool = True):
         if not has_contexts:
-            print("make_ext4fs", self.tr('Warning:file_context not found!!!'))
+            events.append_log.emit("WARN", self.tr('make_ext4fs: file_context not found.'))
         print(f"packing {name} [ext]")
         if not UTC:
             UTC = int(time.time())
@@ -1777,7 +1777,7 @@ class ProjectsPage(QFrame):
                  '-I', '256', '-M', f'/{name}', '-m', '0', '-t', 'ext4', '-b', '4096', f'{work_output}/{name}_new.img',
                  f'{int(size)}']) != 0:
             os.remove(f'{work_output}/{name}_new.img')
-            print(f"packing {name} failed [mke2fs]")
+            events.append_log.emit("ERROR", f"packing {name} failed [mke2fs]")
             return 1
         ret = call(
             ['e2fsdroid', '-e', '-T', f'{utc_time}', '-S', f'{work}/config/{name}_file_contexts', '-C',
@@ -1785,7 +1785,7 @@ class ProjectsPage(QFrame):
              f'{work_output}/{name}_new.img'])
         if ret != 0:
             os.remove(f'{work}/{name}_new.img')
-            print(f"packing {name} failed [e2fsdroid]")
+            events.append_log.emit("ERROR", f"packing {name} failed [e2fsdroid]")
             return 1
         if sparse:
             call(['img2simg', f'{work_output}/{name}_new.img', f'{work_output}/{name}.img'])
@@ -1808,12 +1808,12 @@ class ProjectsPage(QFrame):
         if boot is None:
             boot = utils.findfile(f"{name}.img", work)
             if not boot:
-                print(self.tr("Origin boot is lost.Cannot repack boot.img."))
+                events.append_log.emit("ERROR", self.tr("Origin boot is lost.Cannot repack boot.img."))
                 return 1
         if source is None:
             source = os.path.join(work, name)
         if not os.path.exists(source):
-            print(f"Cannot Find {name}...")
+            events.append_log.emit("ERROR", f"Cannot Find {name}...")
             return 1
         if os.path.isfile(f'{source}/second_order'):
             print(self.tr("Repack Rk resource..."))
@@ -1836,7 +1836,7 @@ class ProjectsPage(QFrame):
             os.chdir(source)
             if comp != "unknown":
                 if call(['magiskboot', f'compress={comp}', 'ramdisk-new.cpio']) != 0:
-                    print("Failed to pack Ramdisk...")
+                    events.append_log.emit("ERROR", self.tr("Failed to pack Ramdisk..."))
                     os.remove("ramdisk-new.cpio")
                 else:
                     try:
@@ -1868,7 +1868,7 @@ class ProjectsPage(QFrame):
             try:
                 rmtree(source)
             except (Exception, BaseException):
-                print(f"Failed to remove {name}")
+                events.append_log.emit("WARN", f"Failed to remove {name}")
             print(self.tr("Successfully packed Boot..."))
         return 0
 
@@ -1935,7 +1935,7 @@ class ProjectsPage(QFrame):
                     if self.mkerofs(dname, str(erofs_compress_format), work=work,
                                     work_output=project_manger.current_work_output_path(), level=int(scale_erofs),
                                     old_kernel=erofs_old_kernel, UTC=UTC) != 0:
-                        print("Failed to repack {} [erofs]".format(dname))
+                        events.append_log.emit("ERROR", "Failed to repack {} [erofs]".format(dname))
                     else:
                         if remove_source_files:
                             self.rdi(work, dname)
@@ -1954,7 +1954,7 @@ class ProjectsPage(QFrame):
                     if self.make_f2fs(dname, work=work, work_output=project_manger.current_work_output_path(),
                                       UTC=UTC, readonly=f2fs_read_only,
                                       compress=f2fs_compresion) != 0:
-                        print("Failed to pack %s!" % dname)
+                        events.append_log.emit("ERROR", "Failed to pack %s!" % dname)
                     else:
                         if remove_source_files:
                             self.rdi(work, dname)
@@ -2008,7 +2008,7 @@ class ProjectsPage(QFrame):
                             size=ext4_size_value,
                             UTC=UTC)
                     if exit_code:
-                        print(self.tr("Failed to pack %s!") % dname)
+                        events.append_log.emit("ERROR",self.tr("Failed to pack %s!") % dname)
                         continue
 
                     if remove_source_files:
@@ -2039,8 +2039,8 @@ class ProjectsPage(QFrame):
     def start_job(self, worker: GenericTaskWorker):
         sys.stderr_old = sys.stderr
         sys.stdout_old = sys.stdout
-        self.stdout_redirector = StreamToSignal(sys.stdout)
-        self.stderr_redirector = StreamToSignal(sys.stderr)
+        self.stdout_redirector = StreamToSignal()
+        self.stderr_redirector = StreamToSignal()
         self.stdout_redirector.text_written.connect(lambda text: self.scroll_log_content.append_log("INFO", text))
         self.stderr_redirector.text_written.connect(lambda text: self.scroll_log_content.append_log("ERROR", text))
         sys.stdout = self.stdout_redirector
@@ -2202,7 +2202,7 @@ class ProjectsPage(QFrame):
                             except (Exception, BaseException):
                                 logging.exception('Bugs')
                         else:
-                            print("File May Not Extracted.")
+                            events.append_log.emit("WARN","File May Not Extracted.")
                     else:
                         events.show_info_bar.emit(self.tr("Error"), self.tr("transferfile of {} missing").format(i), 1,
                                                   3000)
@@ -2325,7 +2325,7 @@ class ProjectsPage(QFrame):
                     try:
                         repaired = repair_erofs_symlinks(os.path.join(work, i))
                     except (OSError, ValueError) as error:
-                        print(f'[erofs] Unpacked {i} has invalid symlinks: {error}', flush=True)
+                        events.append_log.emit("WARN", f'[erofs] Unpacked {i} has invalid symlinks: {error}')
                         continue
                     if repaired:
                         print(f'[erofs] Restored {repaired} Windows symlink markers in unpacked {i}', flush=True)
