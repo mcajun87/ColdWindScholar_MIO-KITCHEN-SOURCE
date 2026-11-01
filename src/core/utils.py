@@ -357,10 +357,11 @@ def zero_start(file: str, c: int, buff_size: int = 8192) -> bool:
 is_empty_img = lambda file: zero_start(file, os.path.getsize(file))
 
 
-def gettype(file) -> str:
+def gettype(file: str, extra_offset: int = 0) -> str:
     """
     Return File Type:str
     :param file: file path
+    :param extra_offset: extra byte offset
     :return:
     """
 
@@ -386,7 +387,7 @@ def gettype(file) -> str:
         ...
     with open(file, 'rb') as f:
         for header, desc, *offset in formats:
-            f.seek(offset[0] if offset else 0)
+            f.seek((offset[0] if offset else 0) + extra_offset)
             if f.read(len(header)) == header:
                 return desc
 
@@ -809,7 +810,6 @@ def generate_bug_report():
         Python: {sys.version}
         Platform: {sys.platform}
         Exec Command: {sys.argv}
-        Tool Version: qt
         Source code running: {states.run_source}
         python Implementation: {platform.python_implementation()}
         Uname: {platform.uname()}
@@ -820,7 +820,7 @@ def generate_bug_report():
     pack_zip(inner, bugreport := os.path.join(output,
                                               f"Mio_Bug_Report{time.strftime('%Y%m%d_%H-%M-%S', time.localtime())}_{v_code()}.zip"))
     re_folder(inner)
-    print(f"\tThe Bug Report Was Saved:{bugreport}")
+    return bugreport
 
 
 class LogoDumper:

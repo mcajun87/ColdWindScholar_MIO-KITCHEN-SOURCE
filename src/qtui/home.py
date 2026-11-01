@@ -29,9 +29,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import PushButton, isDarkTheme, setThemeColor
+from qfluentwidgets import FluentIcon, IconWidget, isDarkTheme, setThemeColor
 from shiboken6 import isValid
 
+from src.core import utils
 from src.core.utils import prog_path
 from src.qtui.settings_cfg import cfg
 from src.qtui.widgets import ClickableLabel
@@ -40,12 +41,12 @@ from src.qtui.widgets import ClickableLabel
 class _SummaryWorker(QThread):
     completed = Signal(object)
 
-    def __init__(self, project_name, project_path, working_folder, include_heavy):
+    def __init__(self, project_name, project_path, working_folder):
         super().__init__()
         self.project_name = project_name
         self.project_path = project_path
         self.working_folder = working_folder
-        self.include_heavy = include_heavy
+        self.include_heavy = True
 
     def run(self):
         result = {
@@ -196,8 +197,8 @@ class HomePage(QWidget):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        folder_icon = QLabel("▰")
-        folder_icon.setStyleSheet("color: #7799E8; font-size: 19px;")
+        folder_icon = IconWidget(FluentIcon.FOLDER, self)
+        folder_icon.setFixedSize(20, 20)
         title = QLabel(self.tr("Workspace"))
         self._set_theme_style(title, "color: #F1F4F8;", "color: #20242C;", "font-size: 18px; font-weight: 700;")
         subtitle = QLabel(self.tr("summary"))
@@ -260,24 +261,17 @@ class HomePage(QWidget):
         main_layout.addLayout(content, 1)
 
         summary_controls = QHBoxLayout()
-        self.summary_status = QLabel()
-        self.summary_status.setWordWrap(True)
-        self._set_theme_style(
-            self.summary_status, "color: #E8B75A;", "color: #946200;", "font-size: 13px;"
-        )
-        self.refresh_summary_btn = PushButton(self.tr("Scan detailed info"), self)
-        self.refresh_summary_btn.clicked.connect(lambda: self.refresh_summary(include_heavy=True))
-        summary_controls.addWidget(self.summary_status, 1)
-        summary_controls.addWidget(self.refresh_summary_btn)
+
+
         dashboard.addLayout(summary_controls)
 
         stats = QGridLayout()
         stats.setHorizontalSpacing(12)
         self.summary_values = {}
         for index, (key, label, icon, accent) in enumerate((
-            ("project_count", self.tr("Projects"), "▰", "#F1F4F8"),
-            ("project_size", self.tr("Project size"), "▱", "#F1F4F8"),
-            ("free_space", self.tr("Disk space left"), "◉", "#77D6A8"),
+            ("project_count", self.tr("Projects"), FluentIcon.FOLDER, "#F1F4F8"),
+            ("project_size", self.tr("Project size"), FluentIcon.DOCUMENT, "#F1F4F8"),
+            ("free_space", self.tr("Disk space left"), FluentIcon.SAVE, "#77D6A8"),
         )):
             card = QFrame()
             card.setObjectName("Card")
@@ -286,8 +280,8 @@ class HomePage(QWidget):
             card_layout.setSpacing(7)
             label_row = QHBoxLayout()
             label_row.setSpacing(9)
-            icon_widget = QLabel(icon)
-            self._set_theme_style(icon_widget, f"color: {accent};", f"color: {accent};", "font-size: 17px;")
+            icon_widget = IconWidget(icon, card)
+            icon_widget.setFixedSize(18, 18)
             label_widget = QLabel(label)
             self._set_theme_style(label_widget, "color: #98A7B8;", "color: #30465C;", "font-size: 14px;")
             label_row.addWidget(icon_widget)
@@ -304,7 +298,7 @@ class HomePage(QWidget):
             stats.setColumnStretch(column, 1)
         dashboard.addLayout(stats)
 
-        self.details_card = self._create_info_card(self.tr("Project"))
+        self.details_card = self._create_info_card(self.tr("Project"), FluentIcon.FOLDER)
         self.details_grid = QGridLayout()
         self.details_grid.setHorizontalSpacing(22)
         self.details_grid.setVerticalSpacing(10)
@@ -313,7 +307,7 @@ class HomePage(QWidget):
         self.details_card.layout().addLayout(self.details_grid)
         dashboard.addWidget(self.details_card)
 
-        self.partitions_card = self._create_info_card(self.tr("Partitions"))
+        self.partitions_card = self._create_info_card(self.tr("Partitions"), FluentIcon.TILES)
         self.partition_count_label = QLabel("—")
         self._set_theme_style(self.partition_count_label, "color: #F1F4F8;", "color: #20242C;", "font-size: 17px; font-weight: 700;")
         self.partitions_card.layout().addWidget(self.partition_count_label)
@@ -323,7 +317,7 @@ class HomePage(QWidget):
         self.partitions_card.layout().addWidget(self.partition_names_label)
         dashboard.addWidget(self.partitions_card)
 
-        self.device_card = self._create_info_card(self.tr("Android device"))
+        self.device_card = self._create_info_card(self.tr("Android device"), FluentIcon.PHONE)
         self.device_grid = QGridLayout()
         self.device_grid.setHorizontalSpacing(22)
         self.device_grid.setVerticalSpacing(10)
@@ -369,18 +363,21 @@ class HomePage(QWidget):
             valid_styles.append((widget, dark_colors, light_colors, common))
         self._theme_styled_widgets = valid_styles
 
-    def _create_info_card(self, title):
+    def _create_info_card(self, title, icon):
         card = QFrame()
         card.setObjectName("Card")
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(16, 12, 16, 14)
         card_layout.setSpacing(10)
         header = QHBoxLayout()
-        heading = QLabel(f"▰  {title}")
+        icon_widget = IconWidget(icon, card)
+        icon_widget.setFixedSize(16, 16)
+        heading = QLabel(title)
         self._set_theme_style(
             heading, "color: #91AFC2;", "color: #547184;",
             "font-size: 14px; font-weight: 600;",
         )
+        header.addWidget(icon_widget)
         header.addWidget(heading)
         header.addStretch()
         card_layout.addLayout(header)
@@ -392,15 +389,11 @@ class HomePage(QWidget):
                 thread.requestInterruption()
         self.refresh_summary(include_heavy=False)
 
-    def refresh_summary(self, include_heavy=False):
+    def refresh_summary(self, include_heavy=True):
         project_name = cfg.currentProjectName.value
         working_folder = cfg.workingFolder.value
         project_path = os.path.join(working_folder, project_name) if project_name else ""
-        self.refresh_summary_btn.setEnabled(False)
-        self.summary_status.setText(
-            self.tr("Scanning project files...") if include_heavy
-            else self.tr("Refreshing basic project information...")
-        )
+
         for key in ("project_size", "free_space", "project_count"):
             self.summary_values[key].setText(self.tr("Loading..."))
         self._set_detail_rows([
@@ -418,25 +411,16 @@ class HomePage(QWidget):
             if thread.isRunning():
                 thread.requestInterruption()
 
-        worker = _SummaryWorker(project_name, project_path, working_folder, include_heavy)
+        worker = _SummaryWorker(project_name, project_path, working_folder)
         worker.setParent(self)
         self._summary_threads.add(worker)
         worker.completed.connect(self._apply_summary)
         worker.finished.connect(lambda thread=worker: self._discard_summary_thread(thread))
-        worker.finished.connect(self._summary_finished)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _discard_summary_thread(self, thread):
         self._summary_threads.discard(thread)
-
-    def _summary_finished(self):
-        if not any(worker.isRunning() for worker in self._summary_threads):
-            self.refresh_summary_btn.setEnabled(True)
-            if self.summary_status.text() in (
-                    self.tr("Refreshing basic project information..."),
-                    self.tr("Scanning project files...")):
-                self.summary_status.setText(self.tr("Refresh did not complete. Please try again."))
 
     def _apply_summary(self, result):
         if (
@@ -444,13 +428,10 @@ class HomePage(QWidget):
             or result["working_folder"] != cfg.workingFolder.value
         ):
             return
-        self.summary_status.setText(
-            self.tr("Project information is up to date.") if result["details_scanned"]
-            else self.tr("Basic information updated. Scan detailed info for file count, size, and device details.")
-        )
+
         self.summary_values["project_count"].setText(str(result["project_count"]))
         self.summary_values["project_size"].setText(
-            self._format_size(result["project_size"]) if result["project_size"] is not None
+            utils.hum_convert(result["project_size"]) if result["project_size"] is not None
             else self.tr("Not scanned") if not result["details_scanned"]
             else self.tr("No project")
         )
@@ -459,7 +440,7 @@ class HomePage(QWidget):
             if result["created_time"] is not None else "—"
         )
         self.summary_values["free_space"].setText(
-            self._format_size(result["free_space"]) if result["free_space"] is not None else self.tr("Unavailable")
+            utils.hum_convert(result["free_space"]) if result["free_space"] is not None else self.tr("Unavailable")
         )
         self._set_detail_rows([
             (self.tr("Name"), result["project_name"] or self.tr("No project selected")),
@@ -542,14 +523,6 @@ class HomePage(QWidget):
         self._theme_styled_widgets = [
             style for style in self._theme_styled_widgets if style[0] is not widget
         ]
-
-    @staticmethod
-    def _format_size(size):
-        size = float(size)
-        for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
-            if size < 1024 or unit == "PB":
-                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
-            size /= 1024
 
     def react(self):
         current_time = datetime.datetime.now()

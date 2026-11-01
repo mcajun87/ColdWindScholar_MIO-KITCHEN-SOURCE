@@ -113,7 +113,7 @@ class PartitionListWorker(QThread):
 
     def run(self):
         try:
-            entries = None
+            entries = []
             if self.mode == "unpack":
                 if not os.path.isdir(self.work):
                     self.loaded.emit(self.request_id, [], self.form, "")
@@ -176,7 +176,7 @@ class PartitionListWorker(QThread):
                     folder,
                     utils.hum_convert(size),
                     parts_dict.get(folder, "Unknown"),
-                    "Source",
+                    self.tr("Source"),
                     "rw",
                 ))
             return data, ""
@@ -192,21 +192,21 @@ class PartitionListWorker(QThread):
                         data.append((
                             partition.partition_name,
                             utils.hum_convert(partition.new_partition_info.size),
-                            "Raw",
-                            "Unknown",
-                            "Unknown",
+                            self.tr("Compressed"),
+                            self.tr("Unknown"),
+                            self.tr("Unknown"),
                         ))
         elif form == "super":
             super_path = os.path.join(work, "super.img")
             if "super.img" in entries:
                 if gettype(super_path) == "sparse":
-                    return data, "The image is sparse, pls convert it to raw first."
-                data.extend((name, "Unknown", "Raw", "Unknown", "Unknown")
-                            for name in lpunpack.get_parts(super_path))
+                    return data, self.tr("The image is sparse, pls convert it to raw first.")
+                data.extend((partition.name, utils.hum_convert(size), "Inner", "Unknown", "Unknown")
+                            for partition, size in lpunpack.get_parts(super_path))
         elif form == "update.app":
             app_path = os.path.join(work, "UPDATE.APP")
             if "UPDATE.APP" in entries:
-                data.extend((name, "Unknown", "Raw", "Unknown", "Unknown")
+                data.extend((name, "Unknown", "Inner", "Unknown", "Unknown")
                             for name in splituapp.get_parts(app_path))
         else:
             for file_name in entries:
@@ -323,7 +323,7 @@ class PackHybridRom:
 
 class ProjectManager:
     def __init__(self):
-        self.hide_items = ['bin', 'src', 'readmes']
+        self.hide_items = ['bin', 'src', 'readmes', "_internal"]
 
     @staticmethod
     def get_work_path(name):
@@ -464,10 +464,11 @@ def logo_dump(file_path, output: str = None, output_name: str = "logo"):
     return utils.LogoDumper(file_path, output + output_name).unpack()
 
 
-def un_dtbo(bn: str = 'dtbo') -> None:
-    if not (dtboimg := utils.findfile(f"{bn}.img", work := project_manger.current_work_path())):
-        print(f"cannot find dtbo {bn}")
-        return
+def un_dtbo(bn: str = 'dtbo', dtboimg:str|None = None) -> None:
+    if not dtboimg:
+        if not (dtboimg := utils.findfile(f"{bn}.img", work := project_manger.current_work_path())):
+            events.append_log.emit("WARN", f"cannot find dtbo {bn}")
+            return
     utils.re_folder(f"{work}/{bn}")
     utils.re_folder(f"{work}/{bn}/dtbo")
     utils.re_folder(f"{work}/{bn}/dts")
@@ -592,11 +593,9 @@ class ProjectsPage(QFrame):
         self.initUI()
 
     def initUI(self):
-        # 1. 基础布局与极简深色背景
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 使用 QFluentWidgets 原生滚动区域
         scroll_area = ScrollArea(self)
         scroll_area.setWidgetResizable(True)
         scroll_log_area = ScrollArea(self)
@@ -606,23 +605,19 @@ class ProjectsPage(QFrame):
         main_layout.addWidget(scroll_log_area)
         main_layout.addWidget(scroll_area)
 
-        # 核心滚动容器
         scroll_content = QWidget()
         self.scroll_log_content = LogMessageBoxBase(self)
         self.scroll_layout = QVBoxLayout(scroll_content)
         events.append_log.connect(self.scroll_log_content.append_log)
 
-        # 【关键优化：增加顶部与四周间距】把原本紧凑的区域整体下调，留出透气的空间
         self.scroll_layout.setContentsMargins(32, 40, 32, 32)
-        self.scroll_layout.setSpacing(10)  # 模块与模块之间拉开足够的高级感间距
+        self.scroll_layout.setSpacing(10)
         scroll_area.setWidget(scroll_content)
         scroll_log_area.setWidget(self.scroll_log_content)
 
-        # 2. 依次构建去背景、去卡片的扁平化模块
         self._build_partition_section(scroll_content)
         self._build_tools_section(scroll_content)
 
-        # 底层弹性推力
         self.scroll_layout.addStretch(1)
         self.setAcceptDrops(True)
         self.initDropOverlay()
@@ -836,7 +831,6 @@ class ProjectsPage(QFrame):
                                       os.path.join(project_manger.current_work_path(), member_name))
                     except Exception as e:
                         events.append_log.emit("ERROR", "cannot rename %s %s" % (member_name, e))
-                print("unzip done")
                 self.script2fs(project_manger.current_work_path())
             events.refresh_projects.emit()
             events.set_project_name.emit(project_name)
@@ -1894,7 +1888,7 @@ class ProjectsPage(QFrame):
                 erofs_compress_format, scale_erofs, erofs_old_kernel, UTC,
                 f2fs_read_only, f2fs_compresion, ext4_packer, scale, ext4_origin_size) -> bool | None:
         if not project_manger.exist():
-            self.show_info_bar(self.tr('Error'), self.tr("project's not exist"), 1)
+            self.show_info_bar(self.tr('Error'), self.tr("project's not exist"), 2)
             return False
         parts_dict = utils.JsonEdit(
             os.path.join(work := project_manger.current_work_path(), "config/parts_info")
@@ -2120,7 +2114,7 @@ class ProjectsPage(QFrame):
                 except (Exception, BaseException):
                     logging.exception('Bugs')
         if not project_manger.exist() or not os.path.exists(project_manger.current_work_path()):
-            events.show_info_bar.emit(self.tr("Warning"), self.tr("Project's not exist"), 3, 3000)
+            events.show_info_bar.emit(self.tr("Warning"), self.tr("Project's not exist"), 2, 3000)
             return False
 
         json_ = utils.JsonEdit(os.path.join(work := project_manger.current_work_path(), "config/parts_info"))
