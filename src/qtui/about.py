@@ -11,23 +11,261 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
 import math
-import os.path
+import os
 import platform
 import random
 import sys
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, Qt, QTimer, Signal, QVariantAnimation
-from PySide6.QtGui import QColor, QCursor, QPainter, QPen, QRadialGradient
+import requests
+from PySide6.QtCore import (
+    QEasingCurve, QPoint, QPointF, QPropertyAnimation, QThread, QTimer, Qt,
+    Signal, QVariantAnimation,
+)
+from PySide6.QtGui import QColor, QCursor, QFont, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import QVBoxLayout, QGridLayout, QHBoxLayout, QFrame, QWidget
 from qfluentwidgets import (
     TitleLabel, BodyLabel, CaptionLabel, HyperlinkLabel,
-    CardWidget
+    CardWidget, MessageBox, MessageBoxBase, ProgressBar, PushButton, TextBrowser,
 )
 
 from src.core.utils import JsonEdit, prog_path
 from src.qtui.settings_cfg import cfg
+from src.core.utils import temp
+
+
+class ReleaseCheckWorker(QThread):
+    release_fetched = Signal(dict)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            response = requests.get(cfg.updateURL.value, timeout=10)
+            response.raise_for_status()
+            release = response.json()
+            if not isinstance(release, dict) or not release.get("tag_name"):
+                raise ValueError("GitHub returned an invalid release response")
+        except (requests.RequestException, ValueError) as error:
+            self.failed.emit(str(error))
+            return
+
+        self.release_fetched.emit(release)
+
+
+class ReleaseDownloadWorker(QThread):
+    progress = Signal(int, int)
+    completed = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, url, output_path, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.output_path = output_path
+
+    def run(self):
+        partial_path = self.output_path + ".part"
+        try:
+            os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+            with requests.get(self.url, stream=True, timeout=(10, 30)) as response:
+                response.raise_for_status()
+                total = int(response.headers.get("content-length", 0))
+                downloaded = 0
+                with open(partial_path, "wb") as output:
+                    for chunk in response.iter_content(chunk_size=256 * 1024):
+                        if self.isInterruptionRequested():
+                            output.close()
+                            os.remove(partial_path)
+                            self.cancelled.emit()
+                            return
+                        if chunk:
+                            output.write(chunk)
+                            downloaded += len(chunk)
+                            self.progress.emit(downloaded, total)
+                if total and downloaded != total:
+                    raise OSError(
+                        f"Incomplete download: received {downloaded} of {total} bytes"
+                    )
+            os.replace(partial_path, self.output_path)
+        except (requests.RequestException, OSError, ValueError) as error:
+            try:
+                if os.path.exists(partial_path):
+                    os.remove(partial_path)
+            except OSError as cleanup_error:
+                error = OSError(f"{error}; unable to remove partial download: {cleanup_error}")
+            self.failed.emit(str(error))
+            return
+
+        self.completed.emit(self.output_path)
+
+
+class ReleaseMessageBox(MessageBoxBase):
+    def __init__(self, release, asset, parent):
+        super().__init__(parent)
+        self.asset = asset
+        self.download_worker = None
+
+        release_name = release.get("name") or release.get("tag_name", "")
+        self.has_update = not release_name.endswith(cfg.Version.value)
+        self.titleLabel = BodyLabel(self.tr("Check update"), self)
+        self.titleLabel.setStyleSheet("font-size: 18px; font-weight: bold;")
+        self.viewLayout.addWidget(self.titleLabel)
+
+        app_title_row = QHBoxLayout()
+        app_title_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        app_title_row.setSpacing(8)
+        app_title = TitleLabel("MIO-KITCHEN", self)
+        title_font = QFont(app_title.font())
+        title_font.setPointSize(27)
+        title_font.setWeight(QFont.Weight.Medium)
+        title_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.2)
+        app_title.setFont(title_font)
+        app_version = CaptionLabel(cfg.Version.value, self)
+        app_version.setTextColor("#737373", "#A0A0A0")
+        app_title_row.addWidget(app_title)
+        app_title_row.addWidget(app_version, 0, Qt.AlignmentFlag.AlignBottom)
+        self.viewLayout.addLayout(app_title_row)
+
+
+        notice = (
+            self.tr("Found new version: {0}").format(release_name)
+            if self.has_update
+            else self.tr("Your version is already the latest!")
+        )
+        release_version = BodyLabel(notice, self)
+        release_version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        release_version.setTextColor(
+            "#14804A" if not self.has_update else "#C97800",
+            "#00B52A" if not self.has_update else "#FFAE00",
+        )
+        self.viewLayout.addWidget(release_version)
+
+        self.release_body = TextBrowser(self)
+        self.release_body.setPlainText(
+            release.get("body") or self.tr("No release notes provided.")
+        )
+        self.release_body.setMinimumHeight(300)
+        self.release_body.setFont(QFont("monospace", 10))
+        self.viewLayout.addWidget(self.release_body)
+
+        self.progress_bar = ProgressBar(self)
+        self.progress_bar.hide()
+        self.viewLayout.addWidget(self.progress_bar)
+        self.status_label = BodyLabel("", self)
+        self.viewLayout.addWidget(self.status_label)
+
+        self.yesButton.setText(self.tr("Update now"))
+        self.cancelButton.setText(self.tr("Cancel"))
+        self.yesButton.setEnabled(self.has_update and asset is not None)
+        if not self.has_update:
+            self.status_label.setText(self.tr("You are already using the latest version."))
+        elif asset is None:
+            self.status_label.setText(
+                self.tr("No download is available for this platform.")
+            )
+
+        self.widget.setMinimumWidth(440)
+
+        self.yesButton.clicked.disconnect()
+        self.cancelButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self.start_download)
+        self.cancelButton.clicked.connect(self.reject)
+
+    def start_download(self):
+        filename = os.path.basename(self.asset.get("name", ""))
+        if not filename:
+            self.status_label.setText(
+                self.tr("The release asset has an invalid filename.")
+            )
+            return
+
+        output_path = os.path.join(temp, filename)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.status_label.setText(self.tr("Starting download…"))
+        self.yesButton.setEnabled(False)
+        self.yesButton.setText(self.tr("Downloading…"))
+        self.cancelButton.setText(self.tr("Cancel download"))
+
+        self.download_worker = ReleaseDownloadWorker(
+            self.asset["browser_download_url"], output_path, self
+        )
+        self.download_worker.progress.connect(self.update_progress)
+        self.download_worker.completed.connect(self.download_completed)
+        self.download_worker.failed.connect(self.download_failed)
+        self.download_worker.cancelled.connect(self.reject)
+        self.download_worker.start()
+        self.cancelButton.clicked.disconnect(self.reject)
+        self.cancelButton.clicked.connect(self.cancel_download)
+
+    def update_progress(self, downloaded, total):
+        if total > 0:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(min(100, downloaded * 100 // total))
+            self.status_label.setText(
+                self.tr("Downloading: {0} / {1} bytes").format(downloaded, total)
+            )
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText(
+                self.tr("Downloading: {0} bytes").format(downloaded)
+            )
+
+    def download_completed(self, output_path):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self._set_status_color("#14804A", "#54D69A")
+        self.status_label.setText(self.tr("Downloaded to: {0}").format(output_path))
+        self.yesButton.setText(self.tr("Downloaded"))
+        self.cancelButton.setText(self.tr("Close"))
+        self.cancelButton.clicked.disconnect(self.cancel_download)
+        self.cancelButton.clicked.connect(self.reject)
+
+    def download_failed(self, error):
+        self._set_status_color("#C53A3A", "#FF7676")
+        self.status_label.setText(self.tr("Download failed: {0}").format(error))
+        self.progress_bar.hide()
+        self.yesButton.setEnabled(True)
+        self.cancelButton.setText(self.tr("Close"))
+        self.cancelButton.clicked.disconnect(self.cancel_download)
+        self.cancelButton.clicked.connect(self.reject)
+
+    def _set_status_color(self, light, dark):
+        self.status_label.setTextColor(light, dark)
+
+    def cancel_download(self):
+        if self.download_worker and self.download_worker.isRunning():
+            self.status_label.setText(self.tr("Cancelling download…"))
+            self.cancelButton.setEnabled(False)
+            self.download_worker.requestInterruption()
+        else:
+            self.reject()
+
+
+def _release_asset_for_platform(release):
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "windows":
+        suffix = "-win.zip"
+    elif system == "linux":
+        suffix = "-linux.zip"
+    elif system == "darwin":
+        suffix = "-macos-intel.zip" if machine == "x86_64" else "-macos.zip"
+    else:
+        return None
+
+    package_name = (release.get("name") or "") + suffix
+    if machine not in {"amd64", "x86_64"}:
+        return None
+    return next(
+        (
+            asset for asset in release.get("assets", [])
+            if asset.get("name", "").lower() == package_name.lower()
+            and asset.get("browser_download_url")
+        ),
+        None,
+    )
 
 
 class BoomEffect(QWidget):
@@ -161,6 +399,7 @@ class AboutPage(QFrame):
         self.setObjectName("AboutPage")
         self._styled_widgets = []
         self._shake_animation = None
+        self._release_check_worker = None
         self.initUI()
         cfg.themeChanged.connect(self._restore_stylesheets)
 
@@ -182,6 +421,28 @@ class AboutPage(QFrame):
             animation.setKeyValueAt(time, origin + QPoint(*offset))
         self._shake_animation = animation
         animation.start()
+
+    def _check_for_updates(self):
+        self.check_update_btn.setEnabled(False)
+        self._release_check_worker = ReleaseCheckWorker(self)
+        self._release_check_worker.release_fetched.connect(self._show_release)
+        self._release_check_worker.failed.connect(self._release_check_failed)
+        self._release_check_worker.finished.connect(
+            lambda: self.check_update_btn.setEnabled(True)
+        )
+        self._release_check_worker.start()
+
+    def _show_release(self, release):
+        ReleaseMessageBox(
+            release, _release_asset_for_platform(release), self
+        ).exec()
+
+    def _release_check_failed(self, error):
+        MessageBox(
+            self.tr("Update check failed"),
+            error,
+            self,
+        ).exec()
 
     def _set_widget_style(self, widget, stylesheet):
         widget.setStyleSheet(stylesheet)
@@ -314,12 +575,16 @@ class AboutPage(QFrame):
         github_lbl.setText(self.tr("GitHub: MIO-KITCHEN-SOURCE"))
         github_lbl.setUrl("https://github.com/ColdWindScholar/MIO-KITCHEN-SOURCE")
 
+        self.check_update_btn = PushButton(self.tr("Check for updates"))
+        self.check_update_btn.clicked.connect(self._check_for_updates)
+
         copyright_lbl = CaptionLabel(self.tr("© 2026 ColdWindScholar All Rights Reserved."))
         copyright_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         footer_layout.addWidget(credit_lbl)
         footer_layout.addWidget(slogan_lbl)
         footer_layout.addWidget(github_lbl)
+        footer_layout.addWidget(self.check_update_btn)
         footer_layout.addWidget(copyright_lbl)
 
         main_layout.addLayout(footer_layout)

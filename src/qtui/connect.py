@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from io import BytesIO
 from platform import system, machine
-from threading import Thread
+from threading import Lock, Thread
 
 import qrcode
 import simple_websocket
@@ -14,26 +14,62 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QTextCursor, QTextCharFormat, 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from flask import Flask, request, jsonify
 from flask_sock import Sock
+from werkzeug.serving import make_server
 from qfluentwidgets import (
     CardWidget,
     BodyLabel,
     TitleLabel,
     PrimaryPushButton,
+    PushButton,
     IconWidget,
     FluentIcon, TextEdit
 )
 from simple_websocket import Server
 from wsproto.frame_protocol import CloseReason
 
-from src.qtui.projects import ProjectsPage
+from src.qtui.projects import ProjectsPage, project_manger
 from src.core.utils import v_code
 
 
 class NetworkBridge(QObject):
-    trigger_signal = Signal(str)
+    trigger_signal = Signal(object)
     log_signal = Signal(str, str)
     connection_status_signal = Signal(bool, dict)
     send_ws_message = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._websocket: Server | None = None
+        self._websocket_lock = Lock()
+
+    def attach_websocket(self, websocket: Server):
+        with self._websocket_lock:
+            previous = self._websocket
+            if previous is not None:
+                try:
+                    self.send_ws_message.disconnect(previous.send)
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    previous.close(CloseReason.NORMAL_CLOSURE, message="Replaced by a new connection.")
+                except simple_websocket.errors.ConnectionClosed:
+                    pass
+
+            self._websocket = websocket
+            self.send_ws_message.connect(websocket.send)
+
+    def detach_websocket(self, websocket: Server | None = None):
+        with self._websocket_lock:
+            active_websocket = self._websocket
+            if active_websocket is None or (websocket is not None and active_websocket is not websocket):
+                return None
+
+            self._websocket = None
+            try:
+                self.send_ws_message.disconnect(active_websocket.send)
+            except (TypeError, RuntimeError):
+                pass
+            return active_websocket
 
 
 flask_backend = Flask(__name__)
@@ -46,7 +82,23 @@ ACTIVE_SESSION = {
     "device_ip": None,
     "verify_code": v_code(4),
 }
-WS: Server | None = None
+
+
+def disconnect(close_websocket=False, websocket: Server | None = None):
+    active_websocket = network_bridge.detach_websocket(websocket)
+    if websocket is not None and active_websocket is None:
+        return False
+
+    ACTIVE_SESSION["token"] = None
+    ACTIVE_SESSION["device_name"] = None
+    ACTIVE_SESSION["device_ip"] = None
+    if close_websocket and active_websocket is not None:
+        try:
+            active_websocket.close(CloseReason.NORMAL_CLOSURE, message="User Disconnect.[Desktop]")
+        except simple_websocket.errors.ConnectionClosed:
+            pass
+    network_bridge.connection_status_signal.emit(False, {})
+    return True
 
 
 @flask_backend.route('/connect', methods=['POST'])
@@ -71,15 +123,6 @@ def handle_handshake():
     return jsonify({"token": generated_token}), 200
 
 
-def disconnect():
-    ACTIVE_SESSION["token"] = None
-    ACTIVE_SESSION["device_name"] = None
-    ACTIVE_SESSION["device_ip"] = None
-    if WS:
-        network_bridge.send_ws_message.disconnect(WS.send)
-    network_bridge.connection_status_signal.emit(False, {})
-
-
 @flask_backend.route('/disconnect', methods=['POST'])
 def handle_disconnect():
     if not ACTIVE_SESSION["token"]:
@@ -91,13 +134,8 @@ def handle_disconnect():
         return f"Unauthorized: Invalid header", 403
     device_ip = request.remote_addr
 
-    disconnect()
+    disconnect(close_websocket=True)
     network_bridge.log_signal.emit("SUCCESS", f"Disconnected by {device_ip}")
-    global WS
-    if WS:
-        network_bridge.log_signal.emit("INFO", f"Close websocket connect.")
-        WS.close(CloseReason.NORMAL_CLOSURE, message="User Disconnect.[Desktop]")
-        WS = None
 
     return "Disconnected already.", 200
 
@@ -147,31 +185,32 @@ def handle_actions(ws: Server):
         return "Unauthorized: Invalid key token", 403
 
     network_bridge.log_signal.emit("INFO", "Websocket connected...")
-    global WS
-    WS = ws
-    network_bridge.send_ws_message.connect(ws.send)
-    while True:
-        try:
-            data = ws.receive(timeout=15)
-        except Exception as e:
-            disconnect()
-            network_bridge.log_signal.emit("WARN", f"TCP connection collapsed {e}")
-            break
-        if data is None:
-            disconnect()
-            break
-        network_bridge.trigger_signal.emit(data)
+    network_bridge.attach_websocket(ws)
+    try:
+        while True:
+            try:
+                data = ws.receive(timeout=15)
+            except Exception as e:
+                network_bridge.log_signal.emit("WARN", f"TCP connection collapsed {e}")
+                break
+            if data is None:
+                break
+            network_bridge.trigger_signal.emit(data)
+    finally:
+        disconnect(websocket=ws)
 
 
 def fetch_linux_lan_ip():
     try:
-        temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        temp_socket.connect(("8.8.8.8", 80))
-        local_ip = temp_socket.getsockname()[0]
-        temp_socket.close()
-        return local_ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as temp_socket:
+            temp_socket.connect(("8.8.8.8", 80))
+            return temp_socket.getsockname()[0]
     except Exception:
         return "127.0.0.1"
+
+
+def list_project():
+    return list(project_manger.get_projects())
 
 
 class ConnectPage(QWidget):
@@ -183,7 +222,6 @@ class ConnectPage(QWidget):
         base_horizontal_layout.setContentsMargins(24, 24, 24, 24)
         base_horizontal_layout.setSpacing(24)
 
-        # ==================== LEFT SIDE: FLUENT CARD HUB ====================
         self.left_card = CardWidget(self)
         left_layout = QVBoxLayout(self.left_card)
         left_layout.setContentsMargins(24, 24, 24, 24)
@@ -207,7 +245,6 @@ class ConnectPage(QWidget):
         self.phone_icon_widget.hide()  # Hidden initially while waiting for connection
         left_layout.addWidget(self.phone_icon_widget, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        # QR Matrix Frame Wrapper
         self.qr_wrapper = CardWidget(self)
         qr_wrapper_layout = QVBoxLayout(self.qr_wrapper)
         qr_wrapper_layout.setContentsMargins(8, 8, 8, 8)
@@ -221,13 +258,11 @@ class ConnectPage(QWidget):
         self.address_label.setFont(QFont("Consolas", 12))
         left_layout.addWidget(self.address_label, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        # Device connection status text widgets
         self.status_device = BodyLabel("", self)
         self.status_ip = BodyLabel("", self)
         left_layout.addWidget(self.status_device, alignment=Qt.AlignmentFlag.AlignHCenter)
         left_layout.addWidget(self.status_ip, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        # Action: Break connection
         self.disconnect_btn = PrimaryPushButton(self.tr("Disconnect"), self)
         self.disconnect_btn.clicked.connect(self.manually_terminate_session)
         self.disconnect_btn.hide()
@@ -235,7 +270,6 @@ class ConnectPage(QWidget):
 
         base_horizontal_layout.addWidget(self.left_card, stretch=2)
 
-        # ==================== RIGHT SIDE: LIVE CONSOLE LOGS ====================
         right_panel_container = QVBoxLayout()
         right_panel_container.setSpacing(8)
 
@@ -246,22 +280,106 @@ class ConnectPage(QWidget):
 
         base_horizontal_layout.addLayout(right_panel_container, stretch=3)
 
-        # ==================== INITIALIZATION ====================
         self.lan_ip = fetch_linux_lan_ip()
-        json_text = json.dumps({"url": f"http://{self.lan_ip}:5000","ws":f"ws://{self.lan_ip}:5000", "verify_code": ACTIVE_SESSION["verify_code"]},
-                               ensure_ascii=True)
         self.address_label.setText(f"http://{self.lan_ip}:5000")
         self.address_label.setStyleSheet("color: green; font-style: bold;")
-        self.render_qr_matrix(json_text)
+        self.refresh_qr_matrix()
+
+        server_controls = QHBoxLayout()
+        self.server_status_label = BodyLabel(self.tr("Server: stopped"), self)
+        self.server_toggle_btn = PrimaryPushButton(self.tr("Start Server"), self)
+        self.server_toggle_btn.clicked.connect(self.toggle_server)
+        self.server_restart_btn = PushButton(self.tr("Restart Server"), self)
+        self.server_restart_btn.clicked.connect(self.restart_server)
+        self.server_restart_btn.setEnabled(False)
+        server_controls.addWidget(self.server_status_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        server_controls.addWidget(self.server_toggle_btn)
+        server_controls.addWidget(self.server_restart_btn)
+        left_layout.addLayout(server_controls)
 
         # Connect core communication bridges
         network_bridge.trigger_signal.connect(self.execute)
         network_bridge.log_signal.connect(self.append_native_console_log)
         network_bridge.connection_status_signal.connect(self.toggle_state)
 
-        self.network_thread = Thread(
-            target=lambda: flask_backend.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False), daemon=True)
+        self.server = None
+        self.network_thread = None
+        self.start_server()
+
+    def start_server(self):
+        if self.network_thread and self.network_thread.is_alive():
+            return True
+        if self.server:
+            self.server.server_close()
+            self.server = None
+
+        try:
+            server = make_server("0.0.0.0", 5000, flask_backend, threaded=True)
+        except OSError as error:
+            self.append_native_console_log("ERROR", f"Unable to start server: {error}")
+            self.server_status_label.setText(self.tr("Server: stopped"))
+            self.server_toggle_btn.setText(self.tr("Start Server"))
+            self.server_restart_btn.setEnabled(False)
+            return False
+
+        self.server = server
+
+        def serve():
+            try:
+                server.serve_forever()
+            except Exception as error:
+                network_bridge.log_signal.emit("ERROR", f"Server stopped unexpectedly: {error}")
+
+        self.network_thread = Thread(target=serve, name="MioConnectServer", daemon=True)
         self.network_thread.start()
+        self.server_status_label.setText(self.tr("Server: Running"))
+        self.server_toggle_btn.setText(self.tr("Stop Server"))
+        self.server_restart_btn.setEnabled(True)
+        self.append_native_console_log("SUCCESS", "Connect server started on port 5000.")
+        return True
+
+    def stop_server(self):
+        server = self.server
+        thread = self.network_thread
+        if server is None or thread is None or not thread.is_alive():
+            if server:
+                server.server_close()
+            self.server = None
+            self.network_thread = None
+            self.server_status_label.setText(self.tr("Server: stopped"))
+            self.server_toggle_btn.setText(self.tr("Start Server"))
+            self.server_restart_btn.setEnabled(False)
+            return True
+
+        self.manually_terminate_session()
+        server.shutdown()
+        thread.join(timeout=3)
+        if thread.is_alive():
+            self.append_native_console_log("ERROR", "Connect server did not stop within 3 seconds.")
+            return False
+
+        server.server_close()
+        self.server = None
+        self.network_thread = None
+        self.server_status_label.setText(self.tr("Server: stopped"))
+        self.server_toggle_btn.setText(self.tr("Start Server"))
+        self.server_restart_btn.setEnabled(False)
+        self.append_native_console_log("INFO", "Connect server stopped.")
+        return True
+
+    def toggle_server(self):
+        if self.server and self.network_thread and self.network_thread.is_alive():
+            self.stop_server()
+        else:
+            self.start_server()
+
+    def restart_server(self):
+        if self.stop_server():
+            self.start_server()
+
+    def closeEvent(self, event):
+        self.stop_server()
+        super().closeEvent(event)
 
     def render_qr_matrix(self, encoding_data_payload):
         qr_generator = qrcode.QRCode(version=1, box_size=10, border=0)
@@ -274,11 +392,17 @@ class ConnectPage(QWidget):
         qt_image_raw = QImage.fromData(image_io_stream.getvalue())
         self.qr_display_container.setPixmap(QPixmap.fromImage(qt_image_raw))
 
+    def refresh_qr_matrix(self):
+        payload = {
+            "url": f"http://{self.lan_ip}:5000",
+            "ws": f"ws://{self.lan_ip}:5000",
+            "verify_code": ACTIVE_SESSION["verify_code"],
+        }
+        self.render_qr_matrix(json.dumps(payload, ensure_ascii=True))
+
     def toggle_state(self, is_connected, device_info_dict=None):
         if not is_connected:
-            self.render_qr_matrix(
-                json.dumps({"url": f"http://{self.lan_ip}:5000","ws":f"ws://{self.lan_ip}:5000", "verify_code": ACTIVE_SESSION["verify_code"]},
-                           ensure_ascii=True))
+            self.refresh_qr_matrix()
         self.toggle_workspace_ui_state(is_connected, device_info_dict)
 
     def toggle_workspace_ui_state(self, is_connected, device_info_dict=None):
@@ -303,24 +427,8 @@ class ConnectPage(QWidget):
             self.address_label.show()
 
     def manually_terminate_session(self):
-        global ACTIVE_SESSION
-        ACTIVE_SESSION = {
-            "token": None,
-            "device_name": None,
-            "device_ip": None,
-            "verify_code": v_code(4),
-        }
-        global WS
-        if WS:
-            network_bridge.log_signal.emit("INFO", self.tr("Close websocket connect."))
-            try:
-                WS.close(CloseReason.NORMAL_CLOSURE, message="User Disconnect.[Desktop]")
-            except simple_websocket.errors.ConnectionClosed:
-                pass
-            network_bridge.send_ws_message.disconnect(WS.send)
-            WS = None
-        self.toggle_workspace_ui_state(False)
-        network_bridge.connection_status_signal.emit(False, {})
+        ACTIVE_SESSION["verify_code"] = v_code(4)
+        disconnect(close_websocket=True)
         self.append_native_console_log("WARN", "Current device session closed manually by host system. Token revoked.")
 
     def append_native_console_log(self, log_level, message_text):
@@ -356,7 +464,7 @@ class ConnectPage(QWidget):
         self.console_log_view.setTextCursor(cursor)
         self.console_log_view.moveCursor(QTextCursor.MoveOperation.End)
 
-    def execute(self, action_data: str | bytes):
+    def execute(self, action_data: str | bytes | dict):
         if isinstance(action_data, bytes):
             action_data = action_data.decode('utf-8')
         # action_types:native_cmd log create_project remove_project refresh_project unpack
@@ -364,5 +472,17 @@ class ConnectPage(QWidget):
         if action_data == '1':
             network_bridge.send_ws_message.emit('1')
             return "1"
-        json_data = json.loads(action_data)
+        try:
+            json_data = json.loads(action_data) if isinstance(action_data, str) else action_data
+        except json.JSONDecodeError as error:
+            network_bridge.log_signal.emit("WARN", f"Invalid action payload: {error}")
+            return "Invalid action payload."
+        if not isinstance(json_data, dict):
+            network_bridge.log_signal.emit("WARN", "Invalid action payload: expected an object.")
+            return "Invalid action payload."
+
+        if json_data.get("argv1") == "list_project":
+            response = json.dumps({"argv1": "list_project", "argv2": list_project()})
+            network_bridge.send_ws_message.emit(response)
+            return response
         return "Action"
