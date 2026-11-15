@@ -465,8 +465,9 @@ def logo_dump(file_path, output: str = None, output_name: str = "logo"):
 
 
 def un_dtbo(bn: str = 'dtbo', dtboimg:str|None = None) -> None:
+    work = project_manger.current_work_path()
     if not dtboimg:
-        if not (dtboimg := utils.findfile(f"{bn}.img", work := project_manger.current_work_path())):
+        if not (dtboimg := utils.findfile(f"{bn}.img", work)):
             events.append_log.emit("WARN", f"cannot find dtbo {bn}")
             return
     utils.re_folder(f"{work}/{bn}")
@@ -720,7 +721,7 @@ class ProjectsPage(QFrame):
             if old_project_name != (new_project_name := cfg.currentProjectName.value):
                 project_manger.remove(old_project_name)
                 events.refresh_projects.emit()
-            cfg.set(cfg.customProjectName, new_project_name)
+            cfg.set(cfg.currentProjectName, new_project_name)
             return
         # ozip
         if ftype == "ozip":
@@ -1028,7 +1029,6 @@ class ProjectsPage(QFrame):
         return result != 1
 
     def delete_project(self):
-        """删除选中的项目并显示提示"""
         project_name = cfg.currentProjectName.value
         if not project_name or not self.project_combo.currentText():
             self.show_info_bar(self.tr("Warning"), self.tr("Select a project first"), bar_type=2)
@@ -1057,7 +1057,6 @@ class ProjectsPage(QFrame):
         layout = QVBoxLayout(self.project_container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        # 下半部分控件区域
         row1 = QHBoxLayout()
         self.project_combo = ComboBox(self.project_container)
         cfg.currentProjectName.valueChanged.connect(self.project_combo.setText)

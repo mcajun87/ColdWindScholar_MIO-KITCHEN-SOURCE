@@ -1,0 +1,169 @@
+import json
+import threading
+
+from flask import Flask, jsonify, request
+from werkzeug.serving import make_server
+
+from src.qtui.connect_api import get_active_project, list_project_files, list_projects
+
+
+MCP_HOST = "127.0.0.1"
+MCP_PORT = 8765
+MCP_PROTOCOL_VERSION = "2025-03-26"
+
+
+class MCPServer:
+    def __init__(self):
+        self._server = None
+        self._thread = None
+        self._app = Flask("mio_mcp_server")
+        self._tools = {
+            "list_projects": {
+                "description": "List the projects available in MIO-KITCHEN.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "handler": lambda _arguments: list_projects(),
+            },
+            "get_active_project": {
+                "description": "Get the name and structure of the currently selected project.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "handler": lambda _arguments: get_active_project(),
+            },
+            "list_project_files": {
+                "description": "List entries in a project folder; paths are relative to the project root.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_name": {"type": "string", "description": "Project name; defaults to the active project."},
+                        "relative_path": {"type": "string", "description": "Folder path relative to the project root."},
+                    },
+                    "additionalProperties": False,
+                },
+                "handler": lambda arguments: list_project_files(
+                    arguments.get("project_name"),
+                    arguments.get("relative_path", ""),
+                ),
+            },
+        }
+        self._app.add_url_rule("/mcp", "mcp", self._handle_request, methods=["POST"])
+
+    @staticmethod
+    def _rpc_error(request_id, code, message):
+        return jsonify({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}})
+
+    def _handle_request(self):
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return jsonify({"error": "MCP endpoint is available only on localhost."}), 403
+        if not request.is_json:
+            return jsonify({"error": "Expected an application/json MCP request."}), 400
+
+        try:
+            payload = request.get_json()
+        except (json.JSONDecodeError, ValueError):
+            return self._rpc_error(None, -32700, "Parse error."), 400
+
+        if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0" or not isinstance(payload.get("method"), str):
+            return self._rpc_error(None, -32600, "Invalid Request."), 400
+
+        method = payload["method"]
+        request_id = payload.get("id")
+        is_notification = "id" not in payload
+        params = payload.get("params") or {}
+        if not isinstance(params, dict):
+            return self._rpc_error(request_id, -32600, "Invalid params."), 400
+
+        if is_notification:
+            return "", 202
+
+        if method == "initialize":
+            result = {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "MIO-KITCHEN", "version": "1.0.0"},
+            }
+            return jsonify({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+        if method == "ping":
+            return jsonify({"jsonrpc": "2.0", "id": request_id, "result": {}})
+
+        if method == "tools/list":
+            tools = [
+                {"name": name, "description": definition["description"], "inputSchema": definition["inputSchema"]}
+                for name, definition in self._tools.items()
+            ]
+            return jsonify({"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools}})
+
+        if method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            tool = self._tools.get(tool_name) if isinstance(tool_name, str) else None
+            if tool is None:
+                return jsonify(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}], "isError": True},
+                    }
+                )
+            if not isinstance(arguments, dict):
+                return self._rpc_error(request_id, -32602, "Tool arguments must be an object.")
+            try:
+                value = tool["handler"](arguments)
+                return jsonify(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}],
+                            "isError": False,
+                        },
+                    }
+                )
+            except (OSError, ValueError) as error:
+                return jsonify(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"content": [{"type": "text", "text": str(error)}], "isError": True},
+                    }
+                )
+
+        return self._rpc_error(request_id, -32601, f"Method not found: {method}"), 404
+
+    @property
+    def is_running(self):
+        return bool(self._thread and self._thread.is_alive() and self._server)
+
+    def start(self):
+        if self.is_running:
+            return True
+
+        try:
+            server = make_server(MCP_HOST, MCP_PORT, self._app, threaded=True)
+        except OSError as error:
+            raise RuntimeError(f"Unable to start MCP server on {MCP_HOST}:{MCP_PORT}: {error}") from error
+
+        thread = threading.Thread(target=server.serve_forever, name="MioMCPServer", daemon=True)
+        self._server = server
+        self._thread = thread
+        thread.start()
+        return True
+
+    def stop(self):
+        server = self._server
+        thread = self._thread
+        if server is None or thread is None or not thread.is_alive():
+            if server:
+                server.server_close()
+            self._server = None
+            self._thread = None
+            return True
+
+        server.shutdown()
+        thread.join(timeout=3)
+        if thread.is_alive():
+            return False
+
+        server.server_close()
+        self._server = None
+        self._thread = None
+        return True

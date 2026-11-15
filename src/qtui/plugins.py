@@ -2,8 +2,10 @@ import json
 import logging
 import os
 import platform
+import subprocess
 import tempfile
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO
 from io import StringIO
 from shutil import rmtree
@@ -53,6 +55,64 @@ from src.qtui.settings import cfg
 
 module_exec = os.path.join(prog_path, 'bin', "exec.sh").replace(os.sep, '/')
 module_error_codes = ModuleErrorCodes
+
+
+class _PluginLogStream:
+    def __init__(self, write_callback):
+        self.write_callback = write_callback
+
+    def write(self, text):
+        if text:
+            self.write_callback(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+class PluginShellWorker(QThread):
+    output_received = Signal(str)
+    run_finished = Signal(bool, str)
+
+    def __init__(self, command: list[str], environment: dict[str, str]):
+        super().__init__()
+        self.command = command
+        self.environment = environment
+
+    def run(self):
+        process = None
+        try:
+            process = subprocess.Popen(
+                self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=self.environment,
+                bufsize=4096
+            )
+            utils.states.open_pids.append(process.pid)
+            while True:
+                output = process.stdout.read1(4096)
+                if not output:
+                    break
+                self.output_received.emit(output.decode("utf-8", errors="replace"))
+            exit_code = process.wait()
+        except Exception as e:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                process.wait()
+            self.run_finished.emit(False, str(e) or repr(e))
+            return
+        finally:
+            if process is not None:
+                if process.pid in utils.states.open_pids:
+                    utils.states.open_pids.remove(process.pid)
+                if process.stdout:
+                    process.stdout.close()
+
+        self.run_finished.emit(
+            exit_code == 0,
+            "" if exit_code == 0 else f"Plugin exited with status {exit_code}."
+        )
 
 
 class ParseMessageBox(MessageBoxBase):
@@ -312,7 +372,7 @@ class ModuleManager(QObject):
             logging.error(f"Error reading info file {info_file} for plugin {id_}: {e}")
             return default
 
-    def run(self, id_=None) -> int:
+    def run(self, id_=None, async_shell=False) -> int | PluginShellWorker | None:
         if not id_:
             return 0
         if not cfg.currentProjectName.value:
@@ -393,6 +453,14 @@ class ModuleManager(QObject):
 
             shell_command_prefix = 'ash' if os.name == 'posix' else 'bash'
             full_shell_command = f"exec {norm_module_exec} {norm_main_sh_path}"
+
+            if async_shell:
+                environment = os.environ.copy()
+                environment.update({key: str(value) for key, value in exports.items()})
+                return PluginShellWorker(
+                    [os.path.join(utils.tool_bin, "busybox"), shell_command_prefix, '-c', full_shell_command],
+                    environment
+                )
 
             call_result = call(["busybox", shell_command_prefix, '-c', full_shell_command], env=exports)
             return call_result
@@ -1516,12 +1584,17 @@ class Events(QObject):
 
 events = Events()
 class PluginPage(QWidget):
+    plugin_output = Signal(str, str)
+    plugin_completed = Signal(str, bool, str)
+    plugin_worker_stopped = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("PluginPage")
         self.built_in_plugins = BuiltInPlugins(self)
         self.local_db_path = os.path.join(prog_path, 'bin', 'plugin_db.json')
         self.tasks = dict() #only to keep qthread alive
+        self.plugin_runs = {}
         self.cards_data = []  # Tracks {"card_widget": card, "title": str, "author": str, "type": "Installed"|"Repo"}
         self.download_status = {}
         self.repo_cards = {}
@@ -1538,6 +1611,9 @@ class PluginPage(QWidget):
         events.plugin_installed.connect(self.load_installed_plugin)
         events.load_plugin_cards.connect(self.load_plugin_cards)
         events.show_info_bar.connect(self.show_info_bar)
+        self.plugin_output.connect(self._update_plugin_log)
+        self.plugin_completed.connect(self._complete_plugin_run)
+        self.plugin_worker_stopped.connect(self._cleanup_plugin_run)
         # 2. Header Layout (Title and Navigation)
         header_layout = QHBoxLayout()
         text_header_layout = QVBoxLayout()
@@ -1885,4 +1961,112 @@ class PluginPage(QWidget):
                 self.load_plugin_cards()
 
     def exec_plugin(self, plugin_id):
-        module_manager.run(plugin_id)
+        run_id = utils.v_code(10)
+        name = module_manager.get_name(plugin_id)
+        running_bar = InfoBar.new(
+            icon=InfoBarIcon.INFORMATION,
+            title=self.tr("Running plugin"),
+            content=self.tr("{} is running...").format(name),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=-1,
+            parent=self.parent()
+        )
+        running_bar.repaint()
+        run_log = StringIO()
+
+        def update_log(text):
+            run_log.write(text)
+            content = run_log.getvalue()
+            if len(content) > 4000:
+                content = content[-4000:]
+                run_log.seek(0)
+                run_log.truncate()
+                run_log.write(content)
+            running_bar.contentLabel.setText(content or self.tr("Plugin is running..."))
+            running_bar.repaint()
+
+        success = True
+        result_text = ""
+        try:
+            with redirect_stdout(_PluginLogStream(update_log)), redirect_stderr(_PluginLogStream(update_log)):
+                result = module_manager.run(plugin_id, async_shell=True)
+            if isinstance(result, PluginShellWorker):
+                self.plugin_runs[run_id] = {
+                    "worker": result,
+                    "bar": running_bar,
+                    "name": name,
+                    "log": run_log,
+                    "completed": False,
+                    "stopped": False
+                }
+                result.output_received.connect(
+                    lambda text, run_id=run_id: self.plugin_output.emit(run_id, text)
+                )
+                result.run_finished.connect(
+                    lambda success, message, run_id=run_id: self.plugin_completed.emit(
+                        run_id, success, message
+                    )
+                )
+                result.finished.connect(
+                    lambda run_id=run_id: self.plugin_worker_stopped.emit(run_id)
+                )
+                result.finished.connect(result.deleteLater)
+                result.start()
+                return
+            if isinstance(result, int) and not isinstance(result, bool) and result != 0:
+                success = False
+                result_text = self.tr("Plugin exited with status {}.").format(result)
+            elif result is not None:
+                result_text = str(result)
+        except Exception as e:
+            logging.exception("Failed to run plugin %s", plugin_id)
+            success = False
+            result_text = str(e) or repr(e)
+
+        self._finish_plugin_run(running_bar, name, run_log, success, result_text)
+
+    def _finish_plugin_run(self, running_bar, name: str, run_log: StringIO, success: bool, result: str):
+        running_bar.close()
+        content = run_log.getvalue().strip()
+        if result:
+            content = "\n".join(part for part in (content, result) if part)
+        events.show_info_bar.emit(
+            self.tr("Plugin done" if success else "Plugin failed"),
+            content or self.tr("{} finished.").format(name),
+            3 if success else 1,
+            5000
+        )
+
+    def _update_plugin_log(self, run_id: str, text: str):
+        state = self.plugin_runs.get(run_id)
+        if not state or state["completed"]:
+            return
+        log = state["log"]
+        log.write(text)
+        content = log.getvalue()
+        if len(content) > 4000:
+            content = content[-4000:]
+            log.seek(0)
+            log.truncate()
+            log.write(content)
+        state["bar"].contentLabel.setText(content or self.tr("Plugin is running..."))
+        state["bar"].repaint()
+
+    def _complete_plugin_run(self, run_id: str, success: bool, result: str):
+        state = self.plugin_runs.get(run_id)
+        if not state or state["completed"]:
+            return
+        state["completed"] = True
+        self._finish_plugin_run(state["bar"], state["name"], state["log"], success, result)
+        if state["stopped"]:
+            self.plugin_runs.pop(run_id, None)
+
+    def _cleanup_plugin_run(self, run_id: str):
+        state = self.plugin_runs.get(run_id)
+        if not state:
+            return
+        state["stopped"] = True
+        if state["completed"]:
+            self.plugin_runs.pop(run_id, None)

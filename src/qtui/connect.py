@@ -1,4 +1,5 @@
 import json
+import os
 import platform
 import socket
 import uuid
@@ -14,7 +15,6 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QTextCursor, QTextCharFormat, 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from flask import Flask, request, jsonify
 from flask_sock import Sock
-from werkzeug.serving import make_server
 from qfluentwidgets import (
     CardWidget,
     BodyLabel,
@@ -25,10 +25,13 @@ from qfluentwidgets import (
     FluentIcon, TextEdit
 )
 from simple_websocket import Server
+from werkzeug.serving import make_server
 from wsproto.frame_protocol import CloseReason
 
-from src.qtui.projects import ProjectsPage, project_manger
-from src.core.utils import v_code
+from src.core.utils import v_code, gettype
+from src.qtui.connect_api import list_projects
+from src.qtui.mcp_server import MCPServer
+from src.qtui.projects import ProjectsPage, events, project_manger
 
 
 class NetworkBridge(QObject):
@@ -172,7 +175,6 @@ def handle_incoming_phone_action():
     return f"Action handled securely", 200
 
 
-#
 @sock_app.route('/socket')
 def handle_actions(ws: Server):
     auth_header = request.headers.get('Authorization', None)
@@ -210,7 +212,7 @@ def fetch_linux_lan_ip():
 
 
 def list_project():
-    return list(project_manger.get_projects())
+    return list_projects()
 
 
 class ConnectPage(QWidget):
@@ -297,6 +299,17 @@ class ConnectPage(QWidget):
         server_controls.addWidget(self.server_restart_btn)
         left_layout.addLayout(server_controls)
 
+        mcp_controls = QHBoxLayout()
+        self.mcp_status_label = BodyLabel(self.tr("MCP Server: stopped"), self)
+        self.mcp_start_btn = PrimaryPushButton(self.tr("Start MCP Server"), self)
+        self.mcp_start_btn.clicked.connect(self.toggle_mcp_server)
+        mcp_controls.addWidget(self.mcp_status_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        mcp_controls.addWidget(self.mcp_start_btn)
+        left_layout.addLayout(mcp_controls)
+        self.mcp_endpoint_label = BodyLabel("http://127.0.0.1:8765/mcp", self)
+        self.mcp_endpoint_label.setFont(QFont("Consolas", 9))
+        left_layout.addWidget(self.mcp_endpoint_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
         # Connect core communication bridges
         network_bridge.trigger_signal.connect(self.execute)
         network_bridge.log_signal.connect(self.append_native_console_log)
@@ -304,6 +317,7 @@ class ConnectPage(QWidget):
 
         self.server = None
         self.network_thread = None
+        self.mcp_server = MCPServer()
         self.start_server()
 
     def start_server(self):
@@ -377,8 +391,38 @@ class ConnectPage(QWidget):
         if self.stop_server():
             self.start_server()
 
+    def toggle_mcp_server(self):
+        if self.mcp_server.is_running:
+            self.stop_mcp_server()
+            return
+
+        try:
+            self.mcp_server.start()
+        except RuntimeError as error:
+            self.mcp_status_label.setText(self.tr("MCP Server: stopped"))
+            self.mcp_start_btn.setText(self.tr("Start MCP Server"))
+            self.append_native_console_log("ERROR", str(error))
+            return
+
+        self.mcp_status_label.setText(self.tr("MCP Server: running"))
+        self.mcp_start_btn.setText(self.tr("Stop MCP Server"))
+        self.append_native_console_log("SUCCESS", "MCP server started at http://127.0.0.1:8765/mcp.")
+
+    def stop_mcp_server(self):
+        was_running = self.mcp_server.is_running
+        if not self.mcp_server.stop():
+            self.append_native_console_log("ERROR", "MCP server did not stop within 3 seconds.")
+            return False
+
+        self.mcp_status_label.setText(self.tr("MCP Server: stopped"))
+        self.mcp_start_btn.setText(self.tr("Start MCP Server"))
+        if was_running:
+            self.append_native_console_log("INFO", "MCP server stopped.")
+        return True
+
     def closeEvent(self, event):
         self.stop_server()
+        self.stop_mcp_server()
         super().closeEvent(event)
 
     def render_qr_matrix(self, encoding_data_payload):
@@ -466,9 +510,11 @@ class ConnectPage(QWidget):
 
     def execute(self, action_data: str | bytes | dict):
         if isinstance(action_data, bytes):
-            action_data = action_data.decode('utf-8')
-        # action_types:native_cmd log create_project remove_project refresh_project unpack
-        # payload: {argv1, argv2}
+            try:
+                action_data = action_data.decode('utf-8')
+            except UnicodeDecodeError:
+                network_bridge.log_signal.emit("WARN", "Invalid action payload: expected UTF-8.")
+                return self.send_action_response({"done": False, "msg": "Invalid action payload."})
         if action_data == '1':
             network_bridge.send_ws_message.emit('1')
             return "1"
@@ -476,13 +522,126 @@ class ConnectPage(QWidget):
             json_data = json.loads(action_data) if isinstance(action_data, str) else action_data
         except json.JSONDecodeError as error:
             network_bridge.log_signal.emit("WARN", f"Invalid action payload: {error}")
-            return "Invalid action payload."
+            return self.send_action_response({"done": False, "msg": "Invalid action payload."})
         if not isinstance(json_data, dict):
             network_bridge.log_signal.emit("WARN", "Invalid action payload: expected an object.")
-            return "Invalid action payload."
+            return self.send_action_response({"done": False, "msg": "Invalid action payload."})
 
-        if json_data.get("argv1") == "list_project":
-            response = json.dumps({"argv1": "list_project", "argv2": list_project()})
-            network_bridge.send_ws_message.emit(response)
-            return response
-        return "Action"
+
+
+        action = json_data.get("action")
+        args = json_data.get("args", {})
+        print(json_data)
+        if not isinstance(args, dict):
+            return self.send_action_response({"done": False, "msg": "args must be an object."})
+
+        try:
+            if action == "list_project":
+                projects = []
+                for name in list_project():
+                    project_path = project_manger.get_work_path(name)
+                    project_stat = os.stat(project_path)
+                    size = 0
+
+                    def raise_walk_error(error):
+                        raise error
+
+                    for root, directories, filenames in os.walk(
+                        project_path, followlinks=False, onerror=raise_walk_error
+                    ):
+                        directories[:] = [
+                            directory for directory in directories
+                            if not os.path.islink(os.path.join(root, directory))
+                        ]
+                        for filename in filenames:
+                            file_path = os.path.join(root, filename)
+                            if not os.path.islink(file_path):
+                                size += os.stat(file_path, follow_symlinks=False).st_size
+
+                    created_time = getattr(project_stat, "st_birthtime", project_stat.st_ctime)
+                    projects.append({
+                        "name": name,
+                        "created_time": str(int(created_time)),
+                        "size": str(size),
+                    })
+                return self.send_action_response({"done": True, "data": projects})
+            if action == "rename_project":
+                project_name = args.get("project_name")
+                new_project_name = args.get("new_project_name")
+                if not isinstance(project_name, str) or not project_name.strip():
+                    return self.send_action_response(
+                        {"done": False, "msg": "project_name must be a non-empty string."}
+                    )
+
+                project_name = project_name.strip().replace(" ", "_")
+                invalid_chars = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}
+                if (
+                    project_name in {".", ".."}
+                    or project_name.startswith(".")
+                    or any(char in invalid_chars or ord(char) < 32 for char in project_name)
+                ):
+                    return self.send_action_response({"done": False, "msg": "Invalid project name."})
+                if not project_manger.exist(project_name):
+                    return self.send_action_response(
+                        {"done": False, "msg": "Project is not exists."}
+                    )
+                project_manger.rename(project_name, new_project_name)
+                events.refresh_projects.emit()
+                self.execute({'action': 'list_project', 'args': {}})
+                return self.send_action_response({"done": True, "msg": "ok"})
+
+            if action == 'remove_project':
+                project_name = args.get("project_name")
+                if not project_manger.exist(project_name):
+                    return self.send_action_response(
+                        {"done": False, "msg": "Project is not exists."}
+                    )
+                project_manger.remove(project_name)
+                events.refresh_projects.emit()
+                return self.send_action_response({"done": True, "msg": "ok"})
+            if action == 'gettype':
+                project_name = args.get("project_name")
+                file_path = args.get("path")
+                real_path = os.path.join(project_manger.get_work_path(project_name), file_path)
+                if not os.path.exists(real_path):
+                    return self.send_action_response(
+                        {"done": False, "msg": "file is not exists."}
+                    )
+                return self.send_action_response(
+                        {"done": True, "file_type": gettype(real_path)}
+                    )
+            if action == "create_project":
+                project_name = args.get("project_name")
+                if not isinstance(project_name, str) or not project_name.strip():
+                    return self.send_action_response(
+                        {"done": False, "msg": "project_name must be a non-empty string."}
+                    )
+
+                project_name = project_name.strip().replace(" ", "_")
+                invalid_chars = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}
+                if (
+                    project_name in {".", ".."}
+                    or project_name.startswith(".")
+                    or any(char in invalid_chars or ord(char) < 32 for char in project_name)
+                ):
+                    return self.send_action_response({"done": False, "msg": "Invalid project name."})
+                if project_manger.exist(project_name):
+                    return self.send_action_response(
+                        {"done": False, "msg": "Project name already exists."}
+                    )
+
+                project_manger.new(project_name)
+                events.refresh_projects.emit()
+                return self.send_action_response({"done": True, "msg": "ok"})
+
+
+            return self.send_action_response({"done": False, "msg": "Unknown action."})
+        except OSError as error:
+            network_bridge.log_signal.emit("ERROR", f"Project action failed: {error}")
+            return self.send_action_response({"done": False, "msg": str(error)})
+
+    @staticmethod
+    def send_action_response(response_data):
+        response = json.dumps(response_data)
+        network_bridge.send_ws_message.emit(response)
+        return response
